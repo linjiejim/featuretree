@@ -24,13 +24,20 @@ const unit2 = (a: V2): V2 => {
 const left = (a: V2): V2 => [-a[1], a[0]]
 
 /** An open path's points, arcs cut into chords within 5 µm. */
-export function pathPoints(points: { to: V2; via?: V2 }[]): V2[] {
+export function pathPoints(points: { to: V2; via?: V2; r?: number; spline?: V2[] }[]): V2[] {
   const out: V2[] = [points[0].to]
+  /** Corners to round afterwards: index in `out`, radius. */
+  const corners: [number, number][] = []
   for (let i = 1; i < points.length; i++) {
     const p = points[i]
     const a = out[out.length - 1]
+    if (p.spline) {
+      out.push(...splinePoints([a, ...p.spline]).slice(1))
+      continue
+    }
     if (!p.via) {
       out.push(p.to)
+      if (p.r && i < points.length - 1) corners.push([out.length - 1, p.r])
       continue
     }
     const arc = arcThrough(a, p.via, p.to)
@@ -44,7 +51,57 @@ export function pathPoints(points: { to: V2; via?: V2 }[]): V2[] {
       out.push([arc.c[0] + arc.r * Math.cos(t), arc.c[1] + arc.r * Math.sin(t)])
     }
   }
-  return out.filter((p, i) => i === 0 || Math.hypot(p[0] - out[i - 1][0], p[1] - out[i - 1][1]) > 1e-9)
+  const rounded = corners.length ? roundCorners(out, corners) : out
+  return rounded.filter((p, i) => i === 0 || Math.hypot(p[0] - rounded[i - 1][0], p[1] - rounded[i - 1][1]) > 1e-9)
+}
+
+/** A smooth curve through the points (Catmull-Rom, the ends held straight), as short segments. */
+export function splinePoints(pts: V2[], per = 16): V2[] {
+  if (pts.length < 2) return pts
+  const at = (i: number): V2 => (i < 0 ? [2 * pts[0][0] - pts[1][0], 2 * pts[0][1] - pts[1][1]] : i >= pts.length ? [2 * pts[pts.length - 1][0] - pts[pts.length - 2][0], 2 * pts[pts.length - 1][1] - pts[pts.length - 2][1]] : pts[i])
+  const out: V2[] = [pts[0]]
+  for (let i = 0; i < pts.length - 1; i++) {
+    const [p0, p1, p2, p3] = [at(i - 1), at(i), at(i + 1), at(i + 2)]
+    for (let k = 1; k <= per; k++) {
+      const t = k / per
+      const t2 = t * t
+      const t3 = t2 * t
+      const c = (a: number, b: number, c2: number, d: number) => 0.5 * (2 * b + (-a + c2) * t + (2 * a - 5 * b + 4 * c2 - d) * t2 + (-a + 3 * b - 3 * c2 + d) * t3)
+      out.push([c(p0[0], p1[0], p2[0], p3[0]), c(p0[1], p1[1], p2[1], p3[1])])
+    }
+  }
+  return out
+}
+
+/** Replace each listed corner by an arc of radius r tangent to its two segments. */
+function roundCorners(pts: V2[], corners: [number, number][]): V2[] {
+  const at = new Map(corners)
+  const out: V2[] = []
+  pts.forEach((a, i) => {
+    const r = at.get(i)
+    if (!r || i === 0 || i === pts.length - 1) return void out.push(a)
+    const unit = (v: V2): V2 => {
+      const l = Math.hypot(v[0], v[1]) || 1
+      return [v[0] / l, v[1] / l]
+    }
+    const d1 = unit([pts[i - 1][0] - a[0], pts[i - 1][1] - a[1]])
+    const d2 = unit([pts[i + 1][0] - a[0], pts[i + 1][1] - a[1]])
+    const alpha = Math.acos(Math.max(-1, Math.min(1, d1[0] * d2[0] + d1[1] * d2[1])))
+    if (alpha < 1e-6 || Math.PI - alpha < 1e-6) return void out.push(a)
+    const t = r / Math.tan(alpha / 2)
+    const bis = unit([d1[0] + d2[0], d1[1] + d2[1]])
+    const h = r / Math.sin(alpha / 2)
+    const c: V2 = [a[0] + bis[0] * h, a[1] + bis[1] * h]
+    const s: V2 = [a[0] + d1[0] * t, a[1] + d1[1] * t]
+    const e: V2 = [a[0] + d2[0] * t, a[1] + d2[1] * t]
+    const a0 = Math.atan2(s[1] - c[1], s[0] - c[0])
+    let sweep = Math.atan2(e[1] - c[1], e[0] - c[0]) - a0
+    while (sweep > Math.PI) sweep -= 2 * Math.PI
+    while (sweep < -Math.PI) sweep += 2 * Math.PI
+    const n = Math.max(4, Math.ceil(Math.abs(sweep) / 0.1))
+    for (let k = 0; k <= n; k++) out.push([c[0] + r * Math.cos(a0 + (sweep * k) / n), c[1] + r * Math.sin(a0 + (sweep * k) / n)])
+  })
+  return out
 }
 
 /** The circle through three points, as a start angle and a signed sweep from a to c via b. */
@@ -130,7 +187,7 @@ function lowAlong(s: Shape3D, dir: V3): number {
  * keep only the pieces that start on the sketch plane. Returns the tool and how
  * far it actually went.
  */
-export function untilNext(long: Shape3D, body: Shape3D, start: V3, dir: V3, mode: "add" | "cut"): { tool: Shape3D; length: number } {
+export function untilNext(long: Shape3D, body: Shape3D, start: V3, dir: V3, mode: "add" | "cut" | "intersect"): { tool: Shape3D; length: number } {
   const pieces = mode === "add" ? long.cut(body) : long.intersect(body)
   const s0 = dot(start, dir)
   const solids = solidsOf(pieces)

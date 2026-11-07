@@ -76,17 +76,21 @@ Claude Code / Codex ──MCP (stdio)──► arbor mcp ──HTTP 127.0.0.1─
 - **谁改的都算**：agent、窗口里的你、直接改文件（编辑器、git），每次改动都记在「动态」里、都能撤销。agent 下一次调用时，结果开头会写「自你上次调用以来，用户改了：W 40 → 45」，避免它把你的改动改回去。
 - **发现**：App 启动时把端口和随机 token 写进 `~/.arbor/engine.json`（权限 600），把怎么启动自己写进 `~/.arbor/app.json`；只监听 127.0.0.1，并检查 Host 头。
 
-## 给 agent 的工具（36 个）
+## 给 agent 的工具（38 个）
 
 | 类 | 工具 |
 | --- | --- |
-| 零件 | `guide`、`open_part`、`list_parts`、`get_state` |
+| 零件和装配 | `guide`、`open_part`（零件 `.arbor.json` 或装配 `.arbor-asm.json`；带 `context` 就是在装配里改这个零件，其他零件半透明显示在旁边）、`list_parts`、`get_state`、`share_params`（几个零件共用一个参数文件 `*.params.json`） |
 | 建模（和网页工作台同一套） | `set_params`、`sketch`、`extrude`、`revolve`、`fillet`、`chamfer`、`shell`、`hole`、`linear_pattern`、`circular_pattern`、`mirror`、`sweep`、`loft`、`draft`、`split`、`rib`、`edit_feature`、`delete_feature` |
-| 导入（只有桌面版） | `import`：读一个 STEP 文件（开发板、元件的官方模型）。缺省作参考体：半透明显示，用来对齐和核对，不并入零件也不导出；`mode: "cut"` 从实体里减去（挖让位槽），`mode: "add"` 并入 |
+| 只有桌面版的建模 | `import`：读一个 STEP 文件（开发板、元件的官方模型），缺省作参考体；`component`：装配里放一个零件文件、子装配或 STEP。建模工具还多几个写法：加料时 `part` 写新名字就新建零件、`mode: "intersect"` 求交、`revolve.start` / `symmetric`、草图点的 `spline` 和拐角圆角 `r`、`extrude.onto` 沿平面或圆柱面等深刻字 |
 | 整体改 | `set_tree`（可带 `base_rev` 防止覆盖）、`move_feature`、`undo`、`redo` |
-| 观测 | `inspect`、`look`（窗口渲染的视图图片）、`measure` |
-| 核对与交付 | `check`（和网页工作台同一张需求核对表：存进零件，每次重建自动重算；桌面版多两项：和参考体之间的 `clearance` 间隙、`interference` 不干涉）、`export`（step / stl / py / json） |
+| 观测 | `inspect`、`look`（窗口渲染的视图图片；`focus` 特写、`section` 剖视、`dir` 任意方向、`hide` 藏零件，最后一步改动很小时自动加一张特写，结果写比例尺）、`measure`（面、边、特征、零件之间；给出坐标） |
+| 核对与交付 | `check`（和网页工作台同一张需求核对表：存进零件，每次重建自动重算；桌面版多几项：`position` 坐标、`gap` 两处之间的距离（`max: 0` = 必须贴上）、`clearance` 间隙、`interference` 不干涉，后两项可以对参考体或零件）、`export`（step / stl（多零件打包成 zip）/ py / json / bom 零件清单） |
 | 和人协作 | `get_notes`、`resolve_note`、`request_pick`（请你在窗口里点一个面或边，等你点完）、`show`（在窗口里高亮给你看） |
+
+每一步的结果会提示几种常见问题：新加的料没接上（写出距离）、只碰到边或点、极小的碎面、新零件和别的零件重叠。
+
+装配的写法和规则见 `docs/specs/2026-11-07-arbor-agent-modeling.md`。
 
 完整的说明在 MCP 的 instructions 里（`guide` 也能读到），坐标约定和选择器写法和网页工作台的提示词是同一份。
 

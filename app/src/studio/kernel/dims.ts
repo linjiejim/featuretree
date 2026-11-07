@@ -164,6 +164,8 @@ function featureDims(f: Feature, g: StepGeom, ctx: Ctx, pitched: Set<string>): D
           break
         case "polyline":
           s.points.forEach((pt, j) => {
+            // A spline's points have no single coordinate to label: its end point carries no dimension.
+            if (!Array.isArray(pt) && "spline" in pt) return
             const xy = Array.isArray(pt) ? pt : pt.to
             const path = Array.isArray(pt) ? [...base, "points", j] : [...base, "points", j, "to"]
             const p: V2 = [n(xy[0]), n(xy[1])]

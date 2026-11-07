@@ -1,11 +1,13 @@
 // Requirement checks (dsl.ts `Check`): the learner's numbers, measured on the
 // latest body by the kernel, not taken on the assistant's word.
-import { getOC, measureDistanceBetween, measureShapeVolumeProperties, type AnyShape, type Shape3D } from "replicad"
+import { getOC, makeCompound, measureDistanceBetween, measureShapeVolumeProperties, type AnyShape, type Shape3D } from "replicad"
 import type { Check, EdgeSelector, FaceSelector } from "../dsl"
 import type { Scope } from "../expr"
 import { METRIC, type ScrewSize } from "../holes"
-import { measure } from "./measure"
-import { disposeInfos, edgeInfos, faceInfos, selectEdges, selectFaces, type FaceInfo } from "./select"
+import { measure, positionOf } from "./measure"
+import { relation, relationText } from "./proximity"
+import { compoundOf } from "./topo"
+import { disposeInfos, edgeInfos, faceInfos, selectEdges, selectFaces, type EdgeInfo, type FaceInfo } from "./select"
 
 type V3 = [number, number, number]
 
@@ -34,15 +36,29 @@ type OC = any
 /** At most this many faces or edges per item: a selector that wide isn't one requirement. */
 const MAX_ITEMS = 50
 
-/** `refs`: reference bodies brought in with `import`, by feature id (for clearance and interference). */
-export function runChecks(body: Shape3D, origins: string[], checks: Check[], scope: Scope, refs: Map<string, AnyShape> = new Map()): CheckResult[] {
+/**
+ * What a check can name besides faces and edges: reference bodies (`import`, and the other parts when
+ * editing inside an assembly) by id and by name, and the model's parts by name.
+ */
+export type CheckBodies = { refs: Map<string, AnyShape>; parts: { name: string; body: Shape3D }[] }
+
+export function runChecks(body: Shape3D, origins: string[], checks: Check[], scope: Scope, bodies: CheckBodies = { refs: new Map(), parts: [] }): CheckResult[] {
   const faces = faceInfos(body, origins)
   const edges = edgeInfos(body, faces)
   try {
     return checks.map((c) => {
       const base = { id: c.id, said: c.said, faces: [] as number[], edges: [] as number[] }
       try {
-        return { ...base, ...(c.kind === "clearance" || c.kind === "interference" ? fit(c, body, refs) : one(c, body, origins, faces, edges, scope)) }
+        return {
+          ...base,
+          ...(c.kind === "clearance" || c.kind === "interference"
+            ? fit(c, body, bodies)
+            : c.kind === "gap"
+              ? gap(c, faces, edges, scope, bodies)
+              : c.kind === "position"
+                ? position(c, faces, edges, scope)
+                : one(c, body, origins, faces, edges, scope)),
+        }
       } catch (e) {
         const first = ((e as Error).message || "没找到要量的东西").split("\n")[0].replace(/。?候选：$/, "")
         return { ...base, pass: false, invalid: true, expected: expectedOf(c), actual: first }
@@ -69,24 +85,130 @@ function expectedOf(c: Check): string {
       return `和「${c.ref}」至少隔 ${fmt(c.min)} mm`
     case "interference":
       return `和「${c.ref}」不相交`
+    case "position":
+      return Array.isArray(c.expect) ? `(${c.expect.map(fmt).join(", ")})` : `${c.axis ?? "?"} = ${fmt(c.expect)}`
+    case "gap":
+      return [c.max === 0 ? "贴在一起" : c.max !== undefined && `≤ ${fmt(c.max)} mm`, c.min !== undefined && `≥ ${fmt(c.min)} mm`].filter(Boolean).join("，") || "量间隙"
     default:
       return `${fmt(c.expect)} mm`
   }
 }
 
 type FitCheck = Extract<Check, { kind: "clearance" | "interference" }>
+type Where = Extract<Check, { kind: "gap" }>["a"]
 
-/** The part against a reference body: the gap between them, and whether they overlap. */
-function fit(c: FitCheck, body: Shape3D, refs: Map<string, AnyShape>): Omit<CheckResult, "id" | "said"> {
+/** A reference body or a part, by name; with a part, the rest of the model is the other side. */
+function named(name: string, bodies: CheckBodies): { shape: AnyShape; rest: AnyShape | null } | null {
+  const ref = bodies.refs.get(name)
+  if (ref) return { shape: ref, rest: null }
+  const k = bodies.parts.findIndex((p) => p.name === name)
+  if (k < 0) return null
+  const others = bodies.parts.filter((_, i) => i !== k).map((p) => p.body)
+  // compoundOf, not makeCompound: replicad's would free the parts.
+  return { shape: bodies.parts[k].body, rest: others.length ? compoundOf(others) : null }
+}
+
+const namesOf = (bodies: CheckBodies) => [...new Set([...bodies.refs.keys(), ...bodies.parts.map((p) => p.name)])]
+
+/** The model against a reference body or one of its parts: the gap between them, and whether they overlap. */
+function fit(c: FitCheck, body: Shape3D, bodies: CheckBodies): Omit<CheckResult, "id" | "said"> {
   const expected = expectedOf(c)
-  const ref = refs.get(c.ref)
-  if (!ref) throw new Error(`没有参考体「${c.ref}」：要先用 import 导入，ref 写那个特征的 id`)
-  const gap = measureDistanceBetween(body, ref)
+  const hit = named(c.ref, bodies)
+  if (!hit) {
+    const names = namesOf(bodies)
+    throw new Error(`没有参考体或零件「${c.ref}」${names.length ? `：现在有 ${names.join("、")}` : "：要先用 import 导入，ref 写那个特征的 id"}`)
+  }
+  if (hit.rest === null && bodies.parts.some((p) => p.name === c.ref)) throw new Error(`只有「${c.ref}」一个零件，没有别的可以比`)
+  try {
+    return fitOf(c, expected, (hit.rest ?? body) as Shape3D, hit.shape)
+  } finally {
+    hit.rest?.delete()
+  }
+}
+
+function fitOf(c: FitCheck, expected: string, other: Shape3D, ref: AnyShape): Omit<CheckResult, "id" | "said"> {
+  const gap = measureDistanceBetween(other, ref)
   // Apart: no overlap, no boolean needed (they can take seconds on a board with many parts).
-  const overlap = gap > 1e-6 ? 0 : overlapVolume(body, ref)
+  const overlap = gap > 1e-6 ? 0 : overlapVolume(other, ref)
   const where = overlap > 1e-6 ? `相交 ${fmt(overlap)} mm³` : gap > 1e-6 ? `最小间隙 ${fmt(gap)} mm` : "贴在一起"
   if (c.kind === "interference") return { pass: overlap <= 1e-6, expected, actual: where, faces: [], edges: [] }
   return { pass: overlap <= 1e-6 && gap >= c.min - (c.tol ?? 0.01), expected, actual: where, faces: [], edges: [] }
+}
+
+/** The shape one side of a `gap` stands for (made shapes go into `owned`) and the faces / edges to light up. */
+function whereShape(w: Where, faces: FaceInfo[], edges: EdgeInfo[], scope: Scope, bodies: CheckBodies, owned: AnyShape[]): { shape: AnyShape; solid: boolean; faces: number[]; edges: number[] } {
+  if (w.part) {
+    const ref = bodies.refs.get(w.part)
+    if (ref) return { shape: ref, solid: true, faces: [], edges: [] }
+    const p = bodies.parts.find((x) => x.name === w.part)
+    if (!p) {
+      const names = namesOf(bodies)
+      throw new Error(`没有零件或参考体「${w.part}」${names.length ? `：现在有 ${names.join("、")}` : ""}`)
+    }
+    return { shape: p.body, solid: true, faces: [], edges: [] }
+  }
+  if (w.feature) {
+    const mine = faces.filter((f) => f.origin === w.feature)
+    if (!mine.length) throw new Error(`特征「${w.feature}」现在没有面（被后面的特征盖掉了，或者 id 写错了）`)
+    const shape = makeCompound(mine.map((f) => f.face.clone())) as unknown as AnyShape
+    owned.push(shape)
+    return { shape, solid: false, faces: mine.map((f) => f.face.hashCode), edges: [] }
+  }
+  if (w.face) {
+    const got = selectFaces(w.face, faces, scope)
+    if (got.length !== 1) throw new Error(`选择器要正好选中一个面，现在选中了 ${got.length} 个`)
+    return { shape: got[0].face, solid: false, faces: [got[0].face.hashCode], edges: [] }
+  }
+  if (w.edge) {
+    const got = selectEdges(w.edge, edges, faces, scope)
+    if (got.length !== 1) throw new Error(`选择器要正好选中一条边，现在选中了 ${got.length} 条`)
+    return { shape: got[0].edge, solid: false, faces: [], edges: [got[0].edge.hashCode] }
+  }
+  throw new Error("a、b 各写 face、edge、feature、part 之一")
+}
+
+/** The shortest distance between two places (0 when solids overlap, with the overlap reported). */
+function gap(c: Extract<Check, { kind: "gap" }>, faces: FaceInfo[], edges: EdgeInfo[], scope: Scope, bodies: CheckBodies): Omit<CheckResult, "id" | "said"> {
+  if (c.min === undefined && c.max === undefined) throw new Error("gap 至少写 min 或 max 之一（max: 0 = 必须贴上）")
+  const owned: AnyShape[] = []
+  try {
+    const a = whereShape(c.a, faces, edges, scope, bodies, owned)
+    const b = whereShape(c.b, faces, edges, scope, bodies, owned)
+    const r = relation(a.shape, b.shape, a.solid && b.solid)
+    const tol = c.tol ?? 0.01
+    const d = r.overlap > 1e-6 ? 0 : r.d
+    const pass = (c.max === undefined || d <= c.max + tol) && (c.min === undefined || (r.overlap <= 1e-6 && d >= c.min - tol))
+    return { pass, expected: expectedOf(c), actual: relationText(r), faces: [...a.faces, ...b.faces], edges: [...a.edges, ...b.edges] }
+  } finally {
+    owned.forEach((s) => s.delete())
+  }
+}
+
+/** Where a face or edge sits: a plane's centre, a cylinder's or circle's centre, a line's midpoint. */
+function position(c: Extract<Check, { kind: "position" }>, faces: FaceInfo[], edges: EdgeInfo[], scope: Scope): Omit<CheckResult, "id" | "said"> {
+  const tol = c.tol ?? 0.01
+  let p: V3
+  let lit: { faces: number[]; edges: number[] }
+  if (c.at.face) {
+    const got = selectFaces(c.at.face, faces, scope)
+    if (got.length !== 1) throw new Error(`选择器要正好选中一个面，现在选中了 ${got.length} 个`)
+    p = positionOf("face", got[0])
+    lit = { faces: [got[0].face.hashCode], edges: [] }
+  } else if (c.at.edge) {
+    const got = selectEdges(c.at.edge, edges, faces, scope)
+    if (got.length !== 1) throw new Error(`选择器要正好选中一条边，现在选中了 ${got.length} 条`)
+    p = positionOf("edge", got[0])
+    lit = { faces: [], edges: [got[0].edge.hashCode] }
+  } else throw new Error("at 写 face 或 edge")
+  const AX = { X: 0, Y: 1, Z: 2 } as const
+  if (Array.isArray(c.expect)) {
+    if (c.axis) throw new Error("写了 axis 时，expect 是一个数")
+    const want = c.expect
+    return { pass: want.every((w, i) => Math.abs(w - p[i]) <= tol), expected: expectedOf(c), actual: `(${p.map(fmt).join(", ")})`, ...lit }
+  }
+  if (!c.axis) throw new Error("expect 是一个数时要写 axis（X、Y 或 Z）")
+  const v = p[AX[c.axis]]
+  return { pass: Math.abs(v - c.expect) <= tol, expected: expectedOf(c), actual: `${c.axis} = ${fmt(v)}`, ...lit }
 }
 
 function overlapVolume(body: Shape3D, ref: AnyShape): number {
@@ -99,7 +221,7 @@ function overlapVolume(body: Shape3D, ref: AnyShape): number {
   }
 }
 
-function one(c: Exclude<Check, FitCheck>, body: Shape3D, origins: string[], faces: FaceInfo[], edges: ReturnType<typeof edgeInfos>, scope: Scope): Omit<CheckResult, "id" | "said"> {
+function one(c: Exclude<Check, FitCheck | { kind: "gap" | "position" }>, body: Shape3D, origins: string[], faces: FaceInfo[], edges: ReturnType<typeof edgeInfos>, scope: Scope): Omit<CheckResult, "id" | "said"> {
   const tol = c.tol ?? (c.kind === "angle" ? 0.05 : 0.01)
   const expected = expectedOf(c)
   const pickFaces = (sel: FaceSelector) => {
@@ -203,7 +325,7 @@ function axesOf(cyls: FaceInfo[]): { p: V3; d: V3; r: number }[] {
   return out
 }
 
-function cylinderAxis(f: FaceInfo): { p: V3; d: V3; r: number } | null {
+export function cylinderAxis(f: FaceInfo): { p: V3; d: V3; r: number } | null {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const ad: any = (f.face as any)._geomAdaptor()
   try {

@@ -10,7 +10,7 @@
 // text goes through JSON.stringify, and comments lose their line breaks. What
 // can't be printed safely becomes None and is listed at the top of the file.
 import { standardHole } from "./holes"
-import type { EdgeSelector, FaceSelector, Feature, PlaneRef, SketchShape } from "./dsl"
+import type { EdgeSelector, FaceSelector, Feature, PlaneRef, Point, SketchShape } from "./dsl"
 import { displayName, Tree } from "./dsl"
 import { CONST_NAMES, FUNC_NAMES, namesIn, parse, type ExprNode } from "./expr"
 
@@ -113,7 +113,7 @@ const ref = (prefix: string, id: string) => (typeof id === "string" && ID.test(i
 const RESERVED = new Set([
   ...FUNC_NAMES,
   ...CONST_NAMES,
-  ..."math part parts joined split_plane rib on_face on_feature show_object".split(" "),
+  ..."math part parts joined split_plane rib on_face on_feature round_corners onto_band show_object".split(" "),
   ..."False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield".split(
     " ",
   ),
@@ -162,32 +162,48 @@ function shape2d(s: SketchShape): string {
     case "path":
       return pathCurve(s.points)
     case "polyline": {
-      const pts = s.points.map((p) => (Array.isArray(p) ? { to: p } : p))
-      const xy = (p: [N, N]) => `(${py(p[0])}, ${py(p[1])})`
+      const pts = points(s.points)
       const segs: string[] = []
+      const rounded: string[] = []
       for (let i = 0; i < pts.length; i++) {
-        const a = pts[i].to as [N, N]
+        const a = pts[i].to
         const next = pts[(i + 1) % pts.length]
-        const b = next.to as [N, N]
-        if (i === pts.length - 1 && !("via" in next && next.via) && JSON.stringify(a) === JSON.stringify(pts[0].to)) break
-        segs.push("via" in next && next.via ? `ThreePointArc(${xy(a)}, ${xy(next.via as [N, N])}, ${xy(b)})` : `Line(${xy(a)}, ${xy(b)})`)
+        if (i === pts.length - 1 && !next.via && !next.spline && JSON.stringify(a) === JSON.stringify(pts[0].to)) break
+        segs.push(segment(a, next))
+        if (next.r !== undefined) rounded.push(`(${xy(next.to)}, ${py(next.r)})`)
       }
-      return `make_face([${segs.join(", ")}])`
+      const face = `make_face([${segs.join(", ")}])`
+      return rounded.length ? `round_corners(${face}, [${rounded.join(", ")}])` : face
     }
   }
 }
 
-/** An open path as one curve: straight runs as a Polyline, arcs as ThreePointArc. */
-function pathCurve(points: (N[] | { to: N[]; via: N[] })[]): string {
-  const pts = points.map((p) => (Array.isArray(p) ? { to: p } : p))
-  const xy = (p: N[]) => `(${py(p[0])}, ${py(p[1])})`
-  const segs = pts.slice(1).map((p, i) => ("via" in p && p.via ? `ThreePointArc(${xy(pts[i].to)}, ${xy(p.via)}, ${xy(p.to)})` : `Line(${xy(pts[i].to)}, ${xy(p.to)})`))
+type Pt = { to: N[]; via?: N[]; r?: N; spline?: N[][] }
+/** Points in one shape: a corner, an arc through `via`, a rounded corner, or a spline ending at its last point. */
+function points(raw: Point[]): Pt[] {
+  return raw.map((p) => (Array.isArray(p) ? { to: p } : "spline" in p ? { to: p.spline[p.spline.length - 1], spline: p.spline } : p))
+}
+const xy = (p: N[]) => `(${py(p[0])}, ${py(p[1])})`
+/** The segment from `a` to the next point. */
+function segment(a: N[], p: Pt): string {
+  if (p.via) return `ThreePointArc(${xy(a)}, ${xy(p.via)}, ${xy(p.to)})`
+  if (p.spline) return `Spline(${[a, ...p.spline].map(xy).join(", ")})`
+  return `Line(${xy(a)}, ${xy(p.to)})`
+}
+
+/** An open path as one curve: straight runs, arcs as ThreePointArc, splines as Spline. */
+function pathCurve(raw: Point[]): string {
+  const pts = points(raw)
+  const segs = pts.slice(1).map((p, i) => segment(pts[i].to, p))
   return segs.length === 1 ? segs[0] : `Curve() + [${segs.join(", ")}]`
 }
 
 /** An open path's corner points, for the rib helper (arcs by their end points). */
-function pathPointsPy(points: (N[] | { to: N[]; via: N[] })[]): string {
-  return `[${points.map((p) => (Array.isArray(p) ? p : p.to)).map((p) => `(${py(p[0])}, ${py(p[1])})`).join(", ")}]`
+function pathPointsPy(raw: Point[]): string {
+  return `[${points(raw)
+    .map((p) => p.to)
+    .map((p) => `(${py(p[0])}, ${py(p[1])})`)
+    .join(", ")}]`
 }
 
 function faces(sel: FaceSelector, base = "part.faces()"): string {
@@ -227,7 +243,8 @@ function edgeFilter(sel: Omit<EdgeSelector, "not" | "expect">) {
   return e
 }
 
-function combine(id: string, mode: "add" | "cut" | undefined) {
+function combine(id: string, mode: "add" | "cut" | "intersect" | undefined) {
+  if (mode === "intersect") return `part = part & ${ref("tool", id)}`
   return mode === "cut" ? `part = part - ${ref("tool", id)}` : `part = ${ref("tool", id)} if part is None else part + ${ref("tool", id)}`
 }
 
@@ -238,10 +255,14 @@ function feature(f: Feature, tree: Tree): string[] {
       const regions = f.shapes.filter((s) => s.type !== "path")
       const paths = f.shapes.filter((s) => s.type === "path")
       const out = [...head]
+      // A sketch an `onto` extrusion uses keeps its plane: resolved now, while the face it sits on still exists.
+      const keepPlane = tree.features.some((x) => x.op === "extrude" && x.onto && x.sketch === f.id)
+      if (keepPlane) out.push(`${ref("plane", f.id)} = ${sketchPlane(f.on)}`)
+      const pl = keepPlane ? ref("plane", f.id) : sketchPlane(f.on)
       if (regions.length) {
         const [first, ...rest] = regions
         const body = rest.reduce((acc, s) => `${acc} ${"cut" in s && s.cut ? "-" : "+"} ${shape2d(s)}`, shape2d(first))
-        out.push(`${ref("sk", f.id)} = ${sketchPlane(f.on)} * (${body})`)
+        out.push(`${ref("sk", f.id)} = ${pl} * (${body})`)
       }
       // An open path: a curve for thin walls (trace), its points for ribs.
       if (paths[0]?.type === "path") out.push(`${ref("path", f.id)} = ${sketchPlane(f.on)} * (${shape2d(paths[0])})`, `${ref("plane", f.id)} = ${sketchPlane(f.on)}`, `${ref("pts", f.id)} = ${pathPointsPy(paths[0].points)}`)
@@ -278,6 +299,13 @@ function feature(f: Feature, tree: Tree): string[] {
         ]
       }
       const d = py(f.distance ?? 0)
+      if (f.onto)
+        return [
+          ...out,
+          "# 沿面等深：草图投影到面上，和面下（切除）或面上（加料）这一层求交",
+          `${ref("tool", f.id)} = extrude(${sk}, amount=1000, both=True) & onto_band(${faces(f.onto)}[0], ${d}, cut=${f.mode === "cut" ? "True" : "False"}, plane=${ref("plane", f.sketch)})`,
+          combine(f.id, f.mode),
+        ]
       const opts = f.direction === "both" ? `amount=${d} / 2, both=True` : f.direction === "reverse" ? `amount=${d}, dir=-${sk}.faces()[0].normal_at()` : `amount=${d}`
       return [...out, `${ref("tool", f.id)} = extrude(${sk}, ${opts}${taper})`, combine(f.id, f.mode)]
     }
@@ -292,6 +320,8 @@ function feature(f: Feature, tree: Tree): string[] {
     }
     case "rib":
       return [...head, `${ref("tool", f.id)} = rib(part, ${ref("plane", f.sketch)}, ${ref("pts", f.sketch)}, ${py(f.t)}${f.flip ? ", flip=True" : ""})`, combine(f.id, "add")]
+    case "component":
+      return [...head, `# 装配里的零件 ${f.file}：装配不能导出成 build123d 代码，请分别导出每个零件`]
     case "import": {
       const v = ref("tool", f.id)
       const out = [...head, `${v} = import_step(${JSON.stringify(f.file)})  # 相对零件文件所在的文件夹`]
@@ -301,8 +331,11 @@ function feature(f: Feature, tree: Tree): string[] {
       if (mode === "reference") return [...out, `# 参考体：只用来对齐和核对间隙，不并入零件`]
       return [...out, combine(f.id, mode)]
     }
-    case "revolve":
-      return [...head, `${ref("tool", f.id)} = revolve(${ref("sk", f.sketch)},axis=${AXIS[f.axis]}${f.angle !== undefined ? `, revolution_arc=${py(f.angle)}` : ""})`, combine(f.id, f.mode)]
+    case "revolve": {
+      const turn = f.symmetric ? `-(${py(f.angle ?? 360)}) / 2` : f.start !== undefined ? py(f.start) : null
+      const rot = turn ? [`${ref("tool", f.id)} = ${ref("tool", f.id)}.rotate(${AXIS[f.axis]}, ${turn})  # 起始角`] : []
+      return [...head, `${ref("tool", f.id)} = revolve(${ref("sk", f.sketch)},axis=${AXIS[f.axis]}${f.angle !== undefined ? `, revolution_arc=${py(f.angle)}` : ""})`, ...rot, combine(f.id, f.mode)]
+    }
     case "fillet":
       return [...head, `part = fillet(${edges(f.edges)}, radius=${py(f.r)})`]
     case "chamfer":
@@ -354,16 +387,15 @@ function feature(f: Feature, tree: Tree): string[] {
       return [...head, ...f.features.map((id) => `for a in [${step} * i for i in range(1, ${c})]:\n    part = part ${modeOf(tree, id) === "cut" ? "-" : "+"} ${rot} * ${ref("tool", id)}`)]
     }
     case "sweep": {
-      const pts = f.path.points.map((p) => (Array.isArray(p) ? { to: p as [N, N] } : { to: p.to as [N, N], via: p.via as [N, N] }))
-      const xy = (p: [N, N]) => `(${py(p[0])}, ${py(p[1])})`
+      const pts = points(f.path.points)
       const pl = sketchPlane(f.path.on)
-      const straight = pts.every((p) => !p.via)
+      const straight = pts.every((p) => !p.via && !p.spline)
       const wire =
         straight && f.path.corner !== undefined
           ? `FilletPolyline(${pts.map((p) => xy(p.to)).join(", ")}, radius=${py(f.path.corner)})`
           : `Wire([${pts
               .slice(1)
-              .map((p, i) => (p.via ? `ThreePointArc(${xy(pts[i].to)}, ${xy(p.via)}, ${xy(p.to)})` : `Line(${xy(pts[i].to)}, ${xy(p.to)})`))
+              .map((p, i) => segment(pts[i].to, p))
               .join(", ")}])`
       const prof = f.profile.type === "circle" ? `Circle(${py(f.profile.d)} / 2)` : `Rectangle(${py(f.profile.w)}, ${py(f.profile.h)})`
       return [
@@ -428,10 +460,25 @@ export function buildCode(raw: Tree, opts: { title?: string; body?: boolean } = 
   const body: string[] = []
   // After a split, body features act on the parts dict (see onParts).
   let partNames: string[] = []
+  // Material added under a new part name starts a part of its own (kernel: newPart); the first one names the body.
+  let mainName: string | undefined
+  let hasBody = false
   for (const f of tree.features) {
     ctx.where = `特征「${clip(oneLine(displayName(tree, f)))}」（${f.id}）`
     ctx.feature = f
     const out = feature(f, tree)
+    const adds = ((f.op === "extrude" || f.op === "revolve" || f.op === "sweep" || f.op === "loft") && (f.mode ?? "add") === "add") || (f.op === "import" && f.mode === "add")
+    const main = mainName ?? "主体"
+    if (adds && f.part && hasBody && !partNames.includes(f.part) && !(partNames.length === 0 && f.part === main)) {
+      const pre = partNames.length ? [] : [`parts = {${JSON.stringify(main)}: part}`]
+      if (!partNames.length) partNames = [main]
+      partNames.push(f.part)
+      const tool = out[out.length - 1].match(/^part = (tool_\w+) if part is None/)?.[1]
+      body.push(...pre, ...out.slice(0, -1), `# 新零件「${oneLine(f.part)}」：不和别的零件合并`, tool ? `parts[${JSON.stringify(f.part)}] = ${tool}` : "# （这一步没有生成工具体）", "part = Compound(list(parts.values()))", "")
+      continue
+    }
+    if (adds && !hasBody && f.part) mainName = f.part
+    if (adds) hasBody = true
     if (f.op === "split") partNames = partNames.filter((n) => n !== f.of).concat(f.parts)
     body.push(...(partNames.length && f.op !== "split" && f.op !== "sketch" ? onParts(out, f, partNames) : out), "")
   }
@@ -512,6 +559,32 @@ Z 轴朝上，单位毫米。选择器按语义转成 build123d 的过滤；「�
     "        if kept:",
     "            return Compound(kept)",
     '    raise ValueError("筋碰不到实体")',
+    "",
+    "",
+    "def round_corners(face, corners):",
+    '    """Round an outline\'s corners at these points: [((x, y), r), …]."""',
+    "    for (x, y), r in corners:",
+    "        face = fillet(face.vertices().sort_by_distance(Vector(x, y, 0))[0], radius=r)",
+    "    return face",
+    "",
+    "",
+    "def onto_band(face, depth, cut, plane, big=1000):",
+    '    """The layer `depth` thick under (cut) or over (add) a planar or cylindrical face; on a cylinder, the side the sketch plane is on (both when it passes through the axis)."""',
+    "    if face.geom_type == GeomType.PLANE:",
+    "        n = face.normal_at()",
+    "        return extrude(Plane(origin=face.center(), z_dir=n) * Rectangle(2 * big, 2 * big), amount=depth, dir=-n if cut else n)",
+    "    axis, r = face.axis_of_rotation, face.radius",
+    "    p = face.position_at(0.5, 0.5)",
+    "    radial = (p - axis.position) - axis.direction * (p - axis.position).dot(axis.direction)",
+    "    convex = face.normal_at(p).dot(radial) > 0",
+    "    inner, outer = (r - depth, r) if cut == convex else (r, r + depth)",
+    "    base = Plane(origin=axis.position - axis.direction * big, z_dir=axis.direction)",
+    "    up = (Align.CENTER, Align.CENTER, Align.MIN)",
+    "    band = base * (Cylinder(outer, 2 * big, align=up) - Cylinder(inner, 2 * big, align=up))",
+    "    side = (plane.origin - axis.position).dot(plane.z_dir)",
+    "    if abs(side) < 1e-6:",
+    "        return band",
+    "    return band & (Plane(origin=axis.position, z_dir=plane.z_dir * (1 if side > 0 else -1)) * Box(4 * big, 4 * big, 2 * big, align=up))",
     "",
     "",
     "def on_feature(items, tool):",

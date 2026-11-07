@@ -158,7 +158,7 @@ async function newPartDialog() {
 }
 
 async function openPartDialog() {
-  const res = await dialog.showOpenDialog({ title: "打开零件", filters: [{ name: "Arbor 零件", extensions: ["json"] }], properties: ["openFile"] })
+  const res = await dialog.showOpenDialog({ title: "打开零件或装配", filters: [{ name: "Arbor 零件和装配", extensions: ["json"] }], properties: ["openFile"] })
   if (res.canceled || !res.filePaths[0]) return null
   return (await openForUser(res.filePaths[0])) ? res.filePaths[0] : null
 }

@@ -483,7 +483,9 @@ describe("tier-1 tools", () => {
     expect(pair.between.find((b) => b.name === "轴线间距")?.value).toBe("45 mm")
     const rim = d.edgeGroups.map((g) => ({ g, p: k.pick({ kind: "edge", hash: g.hash, point: at(0, 0, 0) })! })).find((x) => x.p?.what.includes("R60"))!
     const one = k.measure([{ kind: "edge", hash: rim.g.hash, point: at(0, 0, 0) }])!
-    expect(one.items[0]).toMatchObject({ what: "整圆边", facts: ["直径 ⌀120（R60）", "长 376.99 mm"] })
+    expect(one.items[0]).toMatchObject({ what: "整圆边" })
+    expect(one.items[0].facts.slice(0, 2)).toEqual(["直径 ⌀120（R60）", "长 376.99 mm"])
+    expect(one.items[0].facts[2]).toMatch(/^圆心 \(/)
   }, 60_000)
 
   it("drills standard holes from the metric table and marks tapped ones with thread rings", () => {

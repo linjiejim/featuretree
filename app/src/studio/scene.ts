@@ -36,9 +36,9 @@ export function modelObject(d: DisplayData, kit: MaterialKit, paint: Paint, view
   root.name = "studio-model"
   const materials = [kit.model, kit.highlight, kit.modified, kit.ghost, kit.modelDark]
   // Parts pulled apart or hidden: one mesh (and edge set) per part, moved along its explode vector.
-  if (d.parts && (view.explode > 0 || view.hidden.size)) {
+  if (d.parts && (view.explode > 0 || view.hidden.size || d.parts.some((p) => p.hidden))) {
     d.parts.forEach((part, k) => {
-      if (view.hidden.has(k) || !d.mesh) return
+      if (view.hidden.has(k) || part.hidden || !d.mesh) return
       const groups = d.groups.filter((g) => g.part === k)
       const index: number[] = []
       const own = groups.map((g) => {

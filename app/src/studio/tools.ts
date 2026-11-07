@@ -1,6 +1,6 @@
 import { tool, type ToolSet } from "ai"
 import { z } from "zod"
-import { Check, EdgeSelector, FaceSelector, Feature, Num, type FeatureOp } from "./dsl"
+import { Check, DESKTOP_CHECKS, EdgeSelector, FaceSelector, Feature, Num, SketchShape, WebMode, WebPoint, type FeatureOp } from "./dsl"
 
 /**
  * The tools the model may call. Shared by the server (schemas + how results
@@ -9,6 +9,8 @@ import { Check, EdgeSelector, FaceSelector, Feature, Num, type FeatureOp } from 
  */
 
 const OP_DOCS: Record<FeatureOp, string> = {
+  component:
+    "装配里放一个零件：file 写零件文件（.arbor.json）、子装配（.arbor-asm.json）或外购件（.step），name 是它在装配里的名字，用 rotate、at 摆到位置（先旋转后平移）。只能用在装配文件（.arbor-asm.json）里；要改零件的形状，用 open_part 打开它的文件（加 context 写装配文件，就能看着其他零件改）。",
   sketch: "在基准面（或贴在某个平面上）画一个闭合草图，可以由多个图形组合，cut=true 的图形挖掉前面的图形；图形也可以是文字（刻字、凸字）。草图本身不改变实体。",
   extrude: "把草图沿法向拉伸成实体：mode=add 加料、mode=cut 切除；direction=both 两侧对称（distance 是两侧加起来的总长）；through=true 切除贯穿；until 成形到下一面或某个面（柱子要长到上面的板时用 until: \"next\"，不要自己算距离）；thin 薄壁（等厚的壁，开放的线 path 也能用）；draft 拔模角（锥形凸台、带斜度的槽）。",
   revolve: "把草图绕过原点的一根坐标轴旋转成回转体。轮廓只能在轴的一侧（可以贴着轴）。",
@@ -29,28 +31,108 @@ const OP_DOCS: Record<FeatureOp, string> = {
 }
 
 /** Ops only the desktop app (Arbor) runs: they read files next to the part. Not offered to the site's assistant. */
-export const DESKTOP_OPS = new Set<FeatureOp>(["import"])
+export const DESKTOP_OPS = new Set<FeatureOp>(["import", "component"])
 
+/** The site assistant's check items: without the desktop-only kinds. */
+const WebCheck = z.discriminatedUnion(
+  "kind",
+  Check.options.filter((o) => !DESKTOP_CHECKS.has(o.shape.kind.value)) as unknown as [(typeof Check.options)[number], ...(typeof Check.options)[number][]],
+)
+
+const checkTool = (items: z.ZodType) =>
+  tool({
+    description:
+      "核对学习者提出的数值要求：每项由内核实际量出来，返回 ✓ / ✗，之后每次重建都会自动重算。学习者的话里有具体数值时，建模结束前必须调用一次。size 只量整个零件的外形（包围盒）；某一部分的尺寸（筋的高度、立板的厚度、孔距）用 distance 选两个面，或 thickness 选壁的一侧，选择器加 of、normal，正好选中要量的那个面。",
+    inputSchema: z.object({
+      items: z.array(items).max(20).optional().describe("要核对的项；期望值只写学习者给的数字，不写参数名"),
+      remove: z.array(z.string()).optional().describe("学习者不再要求的项的 id"),
+    }),
+    toModelOutput: ({ output }) => ({ type: "text", value: textOf(output) }),
+  })
+
+type FeatureSchema = (typeof Feature.options)[number]
+
+/** Sketch shapes as the site's assistant writes them: polyline and path points without splines or rounded corners. */
+const WebSketchShape = z.discriminatedUnion(
+  "type",
+  SketchShape.options.map((o) =>
+    o.shape.type.value === "polyline" || o.shape.type.value === "path"
+      ? (o as z.ZodObject).extend({
+          points: z
+            .array(WebPoint)
+            .min(2)
+            .describe(o.shape.type.value === "path" ? "开放的线，依次连接，不自动闭合；只能用于薄壁拉伸（thin）和筋（rib）" : "依次连接并自动闭合；{to, via} 表示三点圆弧"),
+        })
+      : o,
+  ) as unknown as [(typeof SketchShape.options)[number], ...(typeof SketchShape.options)[number][]],
+)
+
+/**
+ * A feature's input as the site's assistant sees it: without what only the desktop app's agents get so far
+ * (intersect, revolve start / symmetric, extrude onto, spline and rounded-corner points). Its evals cover
+ * the rest; these go to it once they're evaluated there.
+ */
+function webShape(schema: FeatureSchema): Record<string, z.ZodType> {
+  const { op: _op, ...shape } = schema.shape as Record<string, z.ZodType>
+  void _op
+  const out: Record<string, z.ZodType> = { ...shape }
+  if ("mode" in out && out.mode !== undefined && schema.shape.op.value !== "import") out.mode = WebMode
+  delete out.onto
+  delete out.start
+  delete out.symmetric
+  if (schema.shape.op.value === "sketch") out.shapes = z.array(WebSketchShape).min(1)
+  if (schema.shape.op.value === "sweep") {
+    const path = (schema.shape as { path: z.ZodObject }).path
+    out.path = path.extend({ points: z.array(WebPoint).min(2).describe("路径点（不闭合）；{to, via} 是三点圆弧") }).describe(path.description ?? "")
+  }
+  return out
+}
+
+const AFTER = z.string().optional().describe("插到这个特征后面；缺省加在最后")
+
+function featureTool(op: FeatureOp, shape: Record<string, z.ZodType>) {
+  return tool({
+    description: OP_DOCS[op],
+    inputSchema: z.object({ ...shape, after: AFTER }),
+    toModelOutput: ({ output }) => ({ type: "text", value: textOf(output) }),
+  })
+}
+
+/** Every feature with every field: the desktop app's agents. */
 const featureTools = Object.fromEntries(
   Feature.options.map((schema) => {
     const { op: opField, ...shape } = schema.shape
-    const op = opField.value as FeatureOp
-    const input = z.object({ ...shape, after: z.string().optional().describe("插到这个特征后面；缺省加在最后") })
-    return [
-      op,
-      tool({
-        description: OP_DOCS[op],
-        inputSchema: input,
-        toModelOutput: ({ output }) => ({ type: "text", value: textOf(output) }),
-      }),
-    ]
+    return [opField.value, featureTool(opField.value as FeatureOp, shape as Record<string, z.ZodType>)]
   }),
 ) as Record<FeatureOp, ReturnType<typeof tool>>
 
-const { import: importTool, ...webFeatureTools } = featureTools
+/** The site's assistant: without the desktop-only ops and fields. */
+const webFeatureTools = Object.fromEntries(
+  Feature.options.flatMap((schema) => {
+    const op = schema.shape.op.value as FeatureOp
+    return DESKTOP_OPS.has(op) ? [] : [[op, featureTool(op, webShape(schema))]]
+  }),
+) as Record<Exclude<FeatureOp, "import" | "component">, ReturnType<typeof tool>>
 
-/** Tools of the desktop app's agents on top of STUDIO_TOOLS (see DESKTOP_OPS). */
-export const DESKTOP_TOOLS = { import: importTool } satisfies ToolSet
+/** Tools of the desktop app's agents on top of STUDIO_TOOLS (see DESKTOP_OPS); `check` replaces the site's with every kind. */
+export const DESKTOP_TOOLS = {
+  ...featureTools,
+  set_params: tool({
+    description:
+      "新建、修改或删除命名参数。值可以是数字或引用其他参数的表达式（如 \"L-2*t\"）。关键尺寸都应该做成参数，特征里用参数名引用。零件用了共享参数文件（share_params）时，共享参数文件里已有的名字会写回那个文件；shared: true 把这次 set 的参数都写进共享文件。",
+    inputSchema: z.object({
+      set: z.record(z.string(), Num).optional().describe("要新建或修改的参数"),
+      remove: z.array(z.string()).optional().describe("要删除的参数名"),
+      notes: z
+        .record(z.string(), z.string())
+        .optional()
+        .describe('参数说明，给学习者看：每个新参数一句短中文，说清是什么尺寸、沿哪个方向，如 { "L": "总长，沿 X", "t": "壁厚" }'),
+      shared: z.boolean().optional().describe("写进共享参数文件（零件要先用 share_params 指定共享参数文件）"),
+    }),
+    toModelOutput: ({ output }) => ({ type: "text", value: textOf(output) }),
+  }),
+  check: checkTool(Check),
+} satisfies ToolSet
 
 export const STUDIO_TOOLS = {
   set_params: tool({
@@ -80,15 +162,7 @@ export const STUDIO_TOOLS = {
     inputSchema: z.object({ id: z.string(), cascade: z.boolean().optional() }),
     toModelOutput: ({ output }) => ({ type: "text", value: textOf(output) }),
   }),
-  check: tool({
-    description:
-      "核对学习者提出的数值要求：每项由内核实际量出来，返回 ✓ / ✗，之后每次重建都会自动重算。学习者的话里有具体数值时，建模结束前必须调用一次。size 只量整个零件的外形（包围盒）；某一部分的尺寸（筋的高度、立板的厚度、孔距）用 distance 选两个面，或 thickness 选壁的一侧，选择器加 of、normal，正好选中要量的那个面。",
-    inputSchema: z.object({
-      items: z.array(Check).max(20).optional().describe("要核对的项；期望值只写学习者给的数字，不写参数名"),
-      remove: z.array(z.string()).optional().describe("学习者不再要求的项的 id"),
-    }),
-    toModelOutput: ({ output }) => ({ type: "text", value: textOf(output) }),
-  }),
+  check: checkTool(WebCheck),
   inspect: tool({
     description:
       "查看当前模型：tree = 特征树和每步结果；body = 包围盒、体积、质心；faces / edges = 列出面或边（可用选择器过滤），用来确认选择器会选中什么。",

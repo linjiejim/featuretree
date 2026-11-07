@@ -133,6 +133,9 @@ const dist = (a: number[], b: number[]) => Math.hypot(a[0] - b[0], a[1] - b[1], 
 /** Is `p` within `pad` of the box (no box: can't tell, so yes)? */
 const near = (box: FaceSig["box"], p: number[], pad: number) => !box || [0, 1, 2].every((j) => p[j] >= box[0][j] - pad && p[j] <= box[1][j] + pad)
 
+/** Do two boxes overlap, within `pad` (either missing: can't tell, so yes)? */
+const overlaps = (a: FaceSig["box"], b: FaceSig["box"], pad: number) => !a || !b || [0, 1, 2].every((j) => a[0][j] <= b[1][j] + pad && b[0][j] <= a[1][j] + pad)
+
 export type FaceStatus = "new" | "modified" | "kept"
 
 /**
@@ -162,6 +165,9 @@ export function classifyFaces(
     if (!s.sample) return { status: "new" as const, match: -1 }
     for (let i = 0; i < prevSigs.length; i++) {
       if (prevSigs[i].type !== s.type) continue
+      // A trimmed, split or extended face still overlaps where it was; a new face that merely lies
+      // on the same plane elsewhere (a second boss as tall as the first) doesn't.
+      if (!overlaps(prevSigs[i].box, s.box, Math.max(1e-3, tol * 10))) continue
       // Projecting onto a spline surface is costly (and grows the wasm heap): a text's
       // hundreds of glyph walls made it 1.7 GB. Only try the ones near the point.
       if (!ANALYTIC.has(s.type) && !near(prevSigs[i].box, s.sample, Math.max(1e-3, tol * 10))) continue

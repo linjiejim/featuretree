@@ -2,55 +2,10 @@ import { beforeAll, describe, expect, it } from "vitest"
 import { initNodeKernel } from "@/studio/kernel/node"
 import { agentCommands, COMMANDS, inputJsonSchema } from "@/desktop/core/catalog"
 import { DirectKernel } from "@/desktop/core/direct-kernel"
-import { Engine, normalizePartPath, notesPath, partName, type Files, type Screen } from "@/desktop/core/engine"
+import { Engine, normalizePartPath, notesPath, partName, type Screen } from "@/desktop/core/engine"
 import type { CallContext, EngineEvent, PickInfo } from "@/desktop/core/protocol"
 import { describeTreeChange } from "@/desktop/core/tree-diff"
-
-/** An in-memory disk; `touch` plays someone else saving the file. */
-function memFiles() {
-  const disk = new Map<string, string | Uint8Array>()
-  const watchers = new Map<string, () => void>()
-  /** Bumped on every write: the modification time of this disk. */
-  const written = new Map<string, number>()
-  let clock = 0
-  const files: Files = {
-    read: async (p) => {
-      const v = disk.get(p)
-      return v === undefined ? null : typeof v === "string" ? v : new TextDecoder().decode(v)
-    },
-    readBytes: async (p) => {
-      const v = disk.get(p)
-      return v === undefined ? null : typeof v === "string" ? new TextEncoder().encode(v) : v
-    },
-    stat: async (p) => {
-      const v = disk.get(p)
-      return v === undefined ? null : { size: typeof v === "string" ? v.length : v.byteLength, mtimeMs: written.get(p) ?? 0 }
-    },
-    write: async (p, d) => {
-      disk.set(p, d)
-      written.set(p, ++clock)
-    },
-    watch: (p, cb) => {
-      watchers.set(p, cb)
-      return () => watchers.delete(p)
-    },
-    // No symlinks in memory: `..` resolves by name, as the real file system would here.
-    canonical: (p) => {
-      const out: string[] = []
-      for (const seg of p.split("/")) {
-        if (seg === "..") out.pop()
-        else out.push(seg)
-      }
-      return out.join("/")
-    },
-  }
-  const touch = async (p: string, data: string | Uint8Array) => {
-    disk.set(p, data)
-    written.set(p, ++clock)
-    watchers.get(p)?.()
-  }
-  return { disk, files, touch }
-}
+import { memFiles } from "./mem-files"
 
 /** A 60 × 40 × 10 block standing on XY, as a STEP file: the kernel's own export plays a vendor's board model. */
 async function boardStep(w = 60, d = 40, h = 10) {

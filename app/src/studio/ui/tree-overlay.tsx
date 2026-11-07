@@ -29,6 +29,7 @@ const OP_ICON: Record<Feature["op"], OpId> = {
   rib: "rib",
   split: "cut",
   import: "boolean",
+  component: "boolean",
 }
 
 function iconOf(f: Feature): OpId {

@@ -5,10 +5,10 @@ import { Worker } from "node:worker_threads"
 import type { KernelHost } from "../../../app/src/desktop/core/engine"
 import type { KernelPhase, V3 } from "../../../app/src/desktop/core/protocol"
 import type { Tree } from "../../../app/src/studio/dsl"
-import type { BuildReport, DisplayData } from "../../../app/src/studio/kernel/build"
+import type { BuildReport, DisplayData, ComponentSource, ContextSource } from "../../../app/src/studio/kernel/build"
 import type { Dim } from "../../../app/src/studio/kernel/dims"
 import type { DrawingData } from "../../../app/src/studio/kernel/drawing"
-import type { MeasureResult, MeasureTarget } from "../../../app/src/studio/kernel/measure"
+import type { MeasureResult, MeasureSpec } from "../../../app/src/studio/kernel/measure"
 import type { PickInfo } from "../../../app/src/studio/annotations"
 import type { KernelReply, KernelRequest } from "./kernel-thread"
 
@@ -110,6 +110,8 @@ export class ThreadKernel implements KernelHost {
         this.worker!.postMessage({ id, op, args } satisfies KernelRequest)
       })
     if (this.assets.length) await send("setAssets", [this.assets])
+    if (this.components.length) await send("setComponents", [this.components])
+    if (this.context) await send("setContext", [this.context])
     if (this.lastTree) await send("rebuild", [this.lastTree])
   }
 
@@ -119,6 +121,20 @@ export class ThreadKernel implements KernelHost {
   async setAssets(list: { name: string; bytes: Uint8Array | null; error?: string }[]) {
     this.assets = list
     await this.call<void>("setAssets", [list])
+  }
+
+  /** An assembly's components and the context of a part edited inside one; kept for a replacement thread too. */
+  private components: ComponentSource[] = []
+  private context: ContextSource | null = null
+
+  async setComponents(list: ComponentSource[]) {
+    this.components = list
+    await this.call<void>("setComponents", [list])
+  }
+
+  async setContext(ctx: ContextSource | null) {
+    this.context = ctx
+    await this.call<void>("setContext", [ctx])
   }
 
   async rebuild(tree: Tree) {
@@ -144,7 +160,7 @@ export class ThreadKernel implements KernelHost {
   faceEdges(hash: number, before: number) {
     return this.call<number[]>("faceEdges", [hash, before])
   }
-  measure(targets: MeasureTarget[]) {
+  measure(targets: MeasureSpec[]) {
     return this.call<MeasureResult | null>("measure", [targets])
   }
   dimensions() {

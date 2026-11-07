@@ -9,10 +9,12 @@ type V3 = [number, number, number]
 type OC = any
 
 export type MeasureTarget = { kind: "face" | "edge"; hash: number; point: V3 }
+/** What the agent can measure besides a face or edge: everything a feature made, or a whole part (or reference body). */
+export type MeasureSpec = MeasureTarget | { kind: "feature"; id: string } | { kind: "part"; name: string }
 
 export type MeasureResult = {
-  /** One line per clicked item: what it is and its own size. */
-  items: { kind: "face" | "edge"; hash: number; what: string; facts: string[] }[]
+  /** One line per clicked item: what it is and its own size. `hash` is -1 for a feature or part. */
+  items: { kind: "face" | "edge" | "feature" | "part"; hash: number; what: string; facts: string[] }[]
   /** Between the two items. */
   between: { name: string; value: string }[]
   /** The shortest segment between them, for a dimension line. */
@@ -117,8 +119,11 @@ function describe(t: MeasureTarget, x: FaceInfo | EdgeInfo, g: Geom): MeasureRes
   if (t.kind === "face") {
     const f = x as FaceInfo
     const facts = [`面积 ${fmt(measureArea(f.face))} mm²`]
-    if (g.type === "axis") facts.unshift(`直径 ⌀${fmt(2 * g.r)}（R${fmt(g.r)}）`)
-    if (g.type === "plane") facts.push(`法向 (${g.n.map(fmt).join(", ")})`)
+    if (g.type === "axis") {
+      facts.unshift(`直径 ⌀${fmt(2 * g.r)}（R${fmt(g.r)}）`)
+      facts.push(`轴线过 ${pt(onAxis(g, f.center))}，方向 ${pt(g.d)}`)
+    }
+    if (g.type === "plane") facts.push(`中心 ${pt(f.center)}`, `法向 (${g.n.map(fmt).join(", ")})`)
     return { kind: "face", hash: t.hash, what: FACE_KIND[f.kind], facts }
   }
   const e = x as EdgeInfo
@@ -126,8 +131,32 @@ function describe(t: MeasureTarget, x: FaceInfo | EdgeInfo, g: Geom): MeasureRes
   if (g.type === "axis") {
     facts.unshift(`直径 ⌀${fmt(2 * g.r)}（R${fmt(g.r)}）`)
     if (!g.full) facts.push(`圆心角 ${fmt(deg(e.length / g.r))}°`)
-  }
+    facts.push(`圆心 ${pt(g.p)}，轴向 ${pt(g.d)}`)
+  } else if (e.kind === "line") facts.push(`从 ${pt(e.start)} 到 ${pt(e.end)}`)
+  else facts.push(`中点 ${pt(e.mid)}`)
   return { kind: "edge", hash: t.hash, what: g.type === "axis" && g.full ? "整圆边" : EDGE_KIND[e.kind], facts }
+}
+
+const pt = (p: V3) => `(${p.map(fmt).join(", ")})`
+/** The point on a cylinder's axis level with `c` (its location alone could be anywhere along the axis). */
+function onAxis(g: { p: V3; d: V3 }, c: V3): V3 {
+  const k = dot(sub(c, g.p), g.d) / dot(g.d, g.d)
+  return [g.p[0] + g.d[0] * k, g.p[1] + g.d[1] * k, g.p[2] + g.d[2] * k]
+}
+
+/**
+ * Where a face or edge is, as one point: a plane's centre, a cylinder's axis level with the face's
+ * centre, a circle's centre, a line's midpoint (the `position` check).
+ */
+export function positionOf(kind: "face" | "edge", x: FaceInfo | EdgeInfo): V3 {
+  const oc: OC = getOC()
+  const g = geomOf(oc, kind, x)
+  if (kind === "face") {
+    const f = x as FaceInfo
+    return g.type === "axis" ? onAxis(g, f.center) : f.center
+  }
+  const e = x as EdgeInfo
+  return g.type === "axis" ? g.p : e.mid
 }
 
 /** Angle between two directions as lines (0–90°). */

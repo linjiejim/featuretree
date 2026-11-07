@@ -5,6 +5,7 @@ import type { PickInfo } from "../../studio/annotations"
 import type { Tree } from "../../studio/dsl"
 import type { BuildReport, DisplayData } from "../../studio/kernel/build"
 import type { MeasureTarget } from "../../studio/kernel/measure"
+import type { LookSection, LookShot } from "../../studio/look-plan"
 
 export type V3 = [number, number, number]
 
@@ -41,13 +42,19 @@ export type PartNote = {
 
 export type KernelPhase = { phase: "loading" } | { phase: "ready" } | { phase: "error"; message: string }
 
-export type PartSummary = { path: string; name: string; features: number; openNotes: number; error?: string }
+export type PartSummary = { path: string; name: string; features: number; openNotes: number; error?: string; kind?: "part" | "assembly" }
 
 /** One open part as the window sees it. */
 export type DocState = {
   path: string
   name: string
+  /** With the shared parameters merged in (their notes say so). */
   tree: Tree
+  kind: "part" | "assembly"
+  /** The shared parameter file the part uses: its name and the parameters it holds. */
+  shared?: { file: string; names: string[]; error?: string }
+  /** Editing inside an assembly: the assembly file and its name. */
+  context?: { assembly: string; name: string }
   rev: number
   report: BuildReport | null
   canUndo: boolean
@@ -73,7 +80,18 @@ export type ShowRequest = { path: string; feature?: string; kind?: "face" | "edg
 
 export type Pin = { n: number; point: V3 }
 
-export type LookRequest = { display: DisplayData; views: string[]; highlight?: string; pins: Pin[] }
+/** `shots` (planned by the engine, look-plan.ts) replace `views` when present. */
+export type LookRequest = {
+  display: DisplayData
+  views: string[]
+  highlight?: string
+  pins: Pin[]
+  shots?: LookShot[]
+  section?: LookSection
+  /** Parts and reference bodies (by name) left out of the pictures. */
+  hide?: string[]
+  size?: "normal" | "large"
+}
 
 export type EngineEvent =
   | { type: "snapshot"; snapshot: Snapshot }

@@ -1,16 +1,17 @@
 import * as React from "react"
-import { CircleAlert, MousePointerClick, Sparkles, X } from "lucide-react"
+import { Boxes, CircleAlert, MousePointerClick, Sparkles, X } from "lucide-react"
 import { Button, IconButton } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { notify } from "@/components/ui/toast"
-import { renderViews } from "@/studio/look"
+import { renderShots, renderViews } from "@/studio/look"
 import { NO_PARTS_VIEW, type Hover, type PartsView } from "@/studio/scene"
 import { CodePanel, ParamsPanel } from "@/studio/ui/side-panels"
 import { StudioViewport } from "@/studio/ui/studio-viewport"
 import { TreeOverlay } from "@/studio/ui/tree-overlay"
 import { useReselect } from "@/studio/use-reselect"
 import { arbor } from "./bridge"
-import type { PartNote, PickRequest, ShowRequest } from "./core/protocol"
+import type { DocState, PartNote, PickRequest, ShowRequest } from "./core/protocol"
+import { besides } from "./core/sources"
 import { asNote, useDesktopNotes, useDesktopStudio, useEngine } from "./use-desktop"
 import { AgentSetupDialog } from "./ui/agent-setup"
 import { NoteComposer } from "./ui/note-composer"
@@ -38,7 +39,13 @@ export function DesktopApp() {
   const [tab, setTab] = React.useState("notes")
 
   // The agent's `look`: render the views it asked for, from the mesh the engine sent.
-  React.useEffect(() => arbor.onLook(async (req) => renderViews(req.display, req.views, req.highlight, { pins: req.pins })), [])
+  React.useEffect(
+    () =>
+      arbor.onLook(async (req) =>
+        req.shots ? renderShots(req.display, req.shots, { highlight: req.highlight, pins: req.pins, section: req.section, hide: req.hide, size: req.size }) : renderViews(req.display, req.views, req.highlight, { pins: req.pins }),
+      ),
+    [],
+  )
   // What 检查更新… found.
   React.useEffect(() => arbor.onNotice((n) => void (n.tone === "error" ? notify.error(n.text) : notify[n.tone](n.text))), [])
 
@@ -99,6 +106,7 @@ export function DesktopApp() {
                     {doc.error}
                   </Banner>
                 )}
+                {!pick && <AssemblyBanner doc={doc} />}
               </div>
             </>
           ) : (
@@ -149,15 +157,59 @@ export function DesktopApp() {
   )
 }
 
-function Banner({ tone, icon, children, action }: { tone: "info" | "warning" | "danger"; icon: React.ReactNode; children: React.ReactNode; action?: React.ReactNode }) {
+/** `keep`: the text keeps its width (a short label beside several buttons) instead of wrapping. */
+function Banner({ tone, icon, children, action, keep }: { tone: "info" | "warning" | "danger"; icon: React.ReactNode; children: React.ReactNode; action?: React.ReactNode; keep?: boolean }) {
   const color = { info: "border-info/40", warning: "border-warning/50", danger: "border-destructive/40" }[tone]
   const iconColor = { info: "text-info", warning: "text-warning", danger: "text-destructive" }[tone]
   return (
     <div role={tone === "danger" ? "alert" : "status"} className={`pointer-events-auto flex max-w-xl items-center gap-2.5 rounded-lg border bg-background py-1.5 pr-1.5 pl-3 shadow-popover ${color}`}>
       <span className={`shrink-0 [&_svg]:size-4 ${iconColor}`}>{icon}</span>
-      <span className="min-w-0 flex-1 text-body">{children}</span>
+      <span className={`${keep ? "shrink-0" : "min-w-0 flex-1"} text-body`}>{children}</span>
       {action}
     </div>
+  )
+}
+
+/**
+ * Assemblies: inside one, say so and offer the way back; on one, offer to edit each part in place
+ * (the others stay around it, see-through).
+ */
+function AssemblyBanner({ doc }: { doc: DocState }) {
+  if (doc.context)
+    return (
+      <Banner
+        tone="info"
+        icon={<Boxes />}
+        action={
+          <Button size="sm" variant="secondary" onClick={() => void arbor.call("open_part", { path: doc.context!.assembly })}>
+            回到装配
+          </Button>
+        }
+      >
+        在装配「{doc.context.name}」里编辑 · 其他零件半透明，只读
+      </Banner>
+    )
+  if (doc.kind !== "assembly") return null
+  const comps = doc.tree.features.flatMap((f) => (f.op === "component" ? [f] : []))
+  if (!comps.length) return null
+  const files = [...new Map(comps.filter((c) => !/\.(step|stp)$/i.test(c.file)).map((c) => [c.file, c])).values()]
+  return (
+    <Banner
+      tone="info"
+      icon={<Boxes />}
+      keep
+      action={
+        <div className="flex flex-wrap justify-end gap-1">
+          {files.slice(0, 6).map((c) => (
+            <Button key={c.file} size="sm" variant="secondary" onClick={() => void arbor.call("open_part", { path: besides(doc.path, c.file), context: doc.path })}>
+              改 {c.name ?? c.file.split("/").pop()}
+            </Button>
+          ))}
+        </div>
+      }
+    >
+      装配 · {comps.length} 个零件
+    </Banner>
   )
 }
 

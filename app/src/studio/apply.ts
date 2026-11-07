@@ -250,7 +250,8 @@ export function treeText(tree: Tree, report: BuildReport) {
     const mark = r?.state === "ok" ? "✓" : r?.state === "error" ? "✗" : r?.state === "suppressed" ? "⊘" : "…"
     const why = f.intent ? ` — ${f.intent}` : ""
     const msg = r?.state === "error" ? ` 失败：${r.message}` : ""
-    return `${i + 1}. ${mark} ${f.id}（${displayName(tree, f)}，${OP_NAMES[f.op as FeatureOp]}）${r?.summary ? `：${r.summary}` : ""}${msg}${why}`
+    const warn = r?.warnings?.length ? `（⚠ ${r.warnings.join("；")}）` : ""
+    return `${i + 1}. ${mark} ${f.id}（${displayName(tree, f)}，${OP_NAMES[f.op as FeatureOp]}）${r?.summary ? `：${r.summary}` : ""}${warn}${msg}${why}`
   })
   return [`参数：${params || "无"}`, ...(rows.length ? rows : ["（特征树是空的）"]), bodyLine(report)].join("\n")
 }

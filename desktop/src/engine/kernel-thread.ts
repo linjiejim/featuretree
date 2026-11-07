@@ -7,7 +7,7 @@ import { initNodeKernel } from "../../../app/src/studio/kernel/node"
 
 export type KernelRequest = {
   id: number
-  op: "setAssets" | "rebuild" | "inspect" | "display" | "pick" | "locate" | "selectorFor" | "faceEdges" | "measure" | "dimensions" | "drawing" | "exportBody"
+  op: "setAssets" | "setComponents" | "setContext" | "rebuild" | "inspect" | "display" | "pick" | "locate" | "selectorFor" | "faceEdges" | "measure" | "dimensions" | "drawing" | "exportBody"
   args: unknown[]
 }
 export type KernelReply =

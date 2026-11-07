@@ -16,6 +16,7 @@ import {
   exportSTEP,
   getOC,
   makeCompound,
+  makeCylinder,
   makePlane,
   measureArea,
   measureShapeVolumeProperties,
@@ -28,16 +29,17 @@ import {
   type Shape3D,
 } from "replicad"
 import type { PickInfo } from "../annotations"
-import { displayName, EMPTY_TREE, OP_NAMES, type EdgeSelector, type Feature, type FeatureOp, type FaceSelector, type PlaneRef, type SketchShape, type Tree } from "../dsl"
+import { displayName, EMPTY_TREE, OP_NAMES, type EdgeSelector, type Feature, type FeatureOp, type FaceSelector, type PlaneRef, type Point, type SketchShape, type Tree } from "../dsl"
 import { num, resolveParams, type Scope } from "../expr"
 import { MAX_COUNT } from "../limits"
 import { referencesOf } from "../apply"
 import { describeError, explain, InputError } from "./errors"
 import { normalizeText, textDrawing } from "./fonts"
-import { measure, type MeasureResult, type MeasureTarget } from "./measure"
+import { measure, type MeasureResult, type MeasureSpec, type MeasureTarget } from "./measure"
+import { closest, relation, TOUCH } from "./proximity"
 import { compoundOf, countOf, edgesOf, facesOf, solidsOf } from "./topo"
 import { dimensionsOf, type Dim, type Frame, type StepGeom } from "./dims"
-import { runChecks, type CheckResult } from "./check"
+import { cylinderAxis, runChecks, type CheckBodies, type CheckResult } from "./check"
 import { pathPoints, planeFace, ribTool, tapered, thinProfile, untilNext } from "./features2"
 import { stepAscii, zipStore } from "../zip"
 import { makeDrawing, type DrawingData } from "./drawing"
@@ -63,7 +65,7 @@ import {
 
 type V3 = [number, number, number]
 type PlaneName = "XY" | "XZ" | "YZ"
-type Tool = { tool: Shape3D; mode: "add" | "cut" }
+type Tool = { tool: Shape3D; mode: "add" | "cut" | "intersect" }
 
 const PLANES: Record<PlaneName, { normal: V3; x: V3; y: V3; axis: 0 | 1 | 2; label: string }> = {
   XY: { normal: [0, 0, 1], x: [1, 0, 0], y: [0, 1, 0], axis: 2, label: "上视基准面" },
@@ -158,7 +160,7 @@ export type DisplayData = {
   /** One per edge: a run of points in `edges` (segment pairs). */
   edgeGroups: { start: number; count: number; hash: number; part?: number }[]
   /** After a split: the parts, with where each moves at full explode. */
-  parts?: { name: string; explode: V3; center: V3 }[]
+  parts?: { name: string; explode: V3; center: V3; hidden?: boolean }[]
   /** Reference bodies (`import`, desktop app): drawn see-through, not part of the model. */
   refs?: { id: string; name: string; mesh: { vertices: Float32Array; normals: Float32Array; triangles: Uint32Array }; edges: Float32Array | null }[]
   /** Outline of the sketch, when the shown step is a sketch. */
@@ -189,12 +191,40 @@ type Step = {
   /** After a split: the parts (`body` is their compound), and each part's face origins. */
   parts?: Part[]
   partOrigins?: string[][]
+  /** The name the first feature gave the body (`part` on the first addition), before there are parts. */
+  mainName?: string
   /** Reference bodies so far (`import` with mode reference): carried along, never merged. */
   refs?: Ref[]
 }
 
 /** A reference body: shown and measured against, not part of the model. `owned`: made by this step. */
 type Ref = { id: string; name: string; shape: AnyShape; mesh: Mesh; edges: EdgeMesh; owned: boolean }
+
+/**
+ * A component of an assembly as the host read it: a STEP file's bytes, or a part (or sub-assembly) file's
+ * tree, already merged with its shared parameters, with what it imports and its own components.
+ */
+export type ComponentSource = {
+  file: string
+  error?: string
+  bytes?: Uint8Array | null
+  tree?: Tree
+  assets?: { name: string; bytes: Uint8Array | null; error?: string }[]
+  components?: ComponentSource[]
+}
+
+/** A built component: its parts' final shapes (unnamed: a single-body part), and how many features failed. */
+type Built = { parts: { name: string | null; shape: Shape3D }[]; failed: number }
+
+/** Built components by content, shared by every kernel in the thread (switching parts doesn't rebuild them). */
+const BUILT = new Map<string, Built>()
+const MAX_BUILT = 16
+
+/** A placement in an assembly, numbers already worked out. */
+export type Placement = { rotate: { axis: "X" | "Y" | "Z"; angle: number }[]; at: V3 }
+
+/** Editing a part inside an assembly: where it sits, and the other components with where they sit. */
+export type ContextSource = { self: Placement; assembly: string; others: { name: string; source: ComponentSource; place: Placement }[] }
 
 /** A file `import` reads, as the host handed it over: parsed once per content. */
 type Asset = { hash: string; shape: AnyShape | null; error?: string }
@@ -206,7 +236,11 @@ type Thread = { r: number; major: number }
  * split moves the normal side along the normal). `owned`: made by this step
  * (else carried over, and freed by the step that made it).
  */
-type Part = { name: string; body: Shape3D; explode: V3; owned: boolean }
+/** `auto`: made by adding material under a new name (or the body that was there): explodes away from the middle. */
+type Part = { name: string; body: Shape3D; explode: V3; owned: boolean; auto?: boolean; hidden?: boolean }
+
+/** New faces smaller than this (mm²) are reported as slivers. */
+const SLIVER_AREA = 0.01
 
 /** Features that change the body; after a split they run on each part (see `onParts`). */
 const BODY_OPS = new Set<FeatureOp>(["extrude", "revolve", "fillet", "chamfer", "shell", "hole", "linear_pattern", "circular_pattern", "mirror", "sweep", "loft", "draft", "rib"])
@@ -221,6 +255,45 @@ export class Kernel {
   private assetsGiven = false
   /** Parsed files by content, so switching parts doesn't parse them again. */
   private parsed = new Map<string, AnyShape>()
+  /** Editing a part inside an assembly: the other parts, placed in this part's frame, drawn see-through (read-only). */
+  private context: Ref[] = []
+  private contextKey = ""
+  /** An assembly's components as the host read them, by the file name written in the feature, and their content keys. */
+  private components = new Map<string, { source: ComponentSource; key: string }>()
+  private componentsGiven = false
+
+  /** The host hands over what an assembly's `component` features read. Call before `rebuild`. */
+  setComponents(list: ComponentSource[]) {
+    this.componentsGiven = true
+    this.components = new Map(list.map((c) => [c.file, { source: c, key: componentKey(c) }]))
+  }
+
+  /**
+   * Editing a part inside an assembly: build the other components (cached) and place them in this part's
+   * frame as see-through, read-only reference bodies. Null leaves the assembly.
+   */
+  setContext(ctx: ContextSource | null) {
+    const key = ctx ? JSON.stringify([ctx.self, ctx.others.map((o) => [o.name, componentKey(o.source), o.place])]) : ""
+    if (key === this.contextKey) return
+    this.context.forEach((r) => r.shape.delete())
+    this.context = []
+    this.contextKey = key
+    if (!ctx) return
+    for (const o of ctx.others) {
+      let built: Built
+      try {
+        built = buildComponent(o.source)
+      } catch {
+        continue
+      }
+      for (const p of built.parts) {
+        const shape = unplace(place(p.shape.clone(), o.place), ctx.self)
+        const name = p.name && built.parts.length > 1 ? `${o.name}/${p.name}` : o.name
+        this.context.push({ id: name, name, shape, mesh: meshShape(shape), edges: meshEdges(shape), owned: true })
+      }
+    }
+  }
+
 
   /**
    * The host (the desktop app) hands over the files `import` features read: the bytes, or why it
@@ -287,7 +360,12 @@ export class Kernel {
     let failed = paramError !== undefined
     for (let i = 0; i < tree.features.length; i++) {
       const f = tree.features[i]
-      key += "\n" + JSON.stringify(f) + (off.has(f.id) ? "\noff" : "") + (f.op === "import" ? `\n${this.assets.get(f.file)?.hash ?? "-"}` : "")
+      key +=
+        "\n" +
+        JSON.stringify(f) +
+        (off.has(f.id) ? "\noff" : "") +
+        (f.op === "import" ? `\n${this.assets.get(f.file)?.hash ?? "-"}` : "") +
+        (f.op === "component" ? `\n${this.components.get(f.file)?.key ?? "-"}` : "")
       const cached = this.steps[i]
       if (cached && cached.key === key) {
         if (cached.result.state === "error" || cached.result.state === "skipped") failed = true
@@ -318,11 +396,21 @@ export class Kernel {
       features,
       lastOk,
       body: last?.body ? stats(last.body) : null,
-      checks: tree.checks?.length && last?.body ? runChecks(last.body, last.origins, tree.checks, this.scope, new Map((last.refs ?? []).map((r) => [r.id, r.shape]))) : undefined,
-      refs: last?.refs?.length ? last.refs.map((r) => ({ id: r.id, name: r.name, size: sizeOf(r.shape) })) : undefined,
+      checks: tree.checks?.length && last?.body ? runChecks(last.body, last.origins, tree.checks, this.scope, this.checkBodies(last)) : undefined,
+      refs: last?.refs?.length || this.context.length ? [...(last?.refs ?? []), ...this.context].map((r) => ({ id: r.id, name: r.name, size: sizeOf(r.shape) })) : undefined,
       parts: last?.parts && last.parts.length > 1 ? last.parts.map((p) => ({ name: p.name, volume: r2(measureShapeVolumeProperties(p.body).volume), size: stats(p.body).size })) : undefined,
       ms: performance.now() - t0,
     }
+  }
+
+  /** What checks can name: reference bodies (and the assembly context) by id and name, parts by name. */
+  private checkBodies(step: Step): CheckBodies {
+    const refs = new Map<string, AnyShape>()
+    for (const r of [...(step.refs ?? []), ...this.context]) {
+      refs.set(r.id, r.shape)
+      refs.set(r.name, r.shape)
+    }
+    return { refs, parts: step.parts ?? [] }
   }
 
   /** Mesh + per-face status of one step (default: the last that built). */
@@ -354,10 +442,11 @@ export class Kernel {
       const bb = body.body.boundingBox.bounds as [V3, V3]
       out.bbox = [[...bb[0]], [...bb[1]]] as [V3, V3]
       out.threads = this.threadRings(this.steps.indexOf(body), body)
-      if (body.parts && body.parts.length > 1) {
+      if (body.parts && (body.parts.length > 1 || body.parts.some((p) => p.hidden))) {
         // Which part each face and edge belongs to, for colouring, hiding and exploding parts.
         const faceToPart = new Map<number, number>()
         const edgeToPart = new Map<number, number>()
+        const auto = autoExplode(body.parts)
         out.parts = body.parts.map((p, k) => {
           const fs = facesOf(p.body)
           const es = edgesOf(p.body)
@@ -366,14 +455,15 @@ export class Kernel {
           fs.forEach((f) => f.delete())
           es.forEach((e) => e.delete())
           const [a, b] = p.body.boundingBox.bounds as [V3, V3]
-          return { name: p.name, explode: p.explode, center: mul(add(a, b), 0.5) }
+          return { name: p.name, explode: p.auto ? add(p.explode, auto[k]) : p.explode, center: mul(add(a, b), 0.5), hidden: p.hidden }
         })
         out.groups = out.groups.map((g) => ({ ...g, part: faceToPart.get(g.hash) }))
         out.edgeGroups = out.edgeGroups.map((g) => ({ ...g, part: edgeToPart.get(g.hash) }))
       }
     }
-    const refs = (body ?? step).refs
-    if (refs?.length) {
+    // The assembly around a part being edited in context draws like reference bodies.
+    const refs = [...((body ?? step)?.refs ?? []), ...this.context]
+    if (refs.length) {
       out.refs = refs.map((r) => ({
         id: r.id,
         name: r.name,
@@ -705,10 +795,59 @@ export class Kernel {
   }
 
   /** Sizes of one or two clicked faces / edges of the latest body, and how they relate. */
-  measure(targets: MeasureTarget[]): MeasureResult | null {
+  measure(targets: MeasureSpec[]): MeasureResult | null {
     const step = this.lastBuilt(this.steps.length)
     if (!step?.body || !targets.length) return null
-    return measure(step.body, step.origins, targets.slice(0, 2))
+    const two = targets.slice(0, 2)
+    if (two.every((t) => t.kind === "face" || t.kind === "edge")) return measure(step.body, step.origins, two as MeasureTarget[])
+    const owned: AnyShape[] = []
+    try {
+      const items = two.map((t) => this.targetShape(step, t, owned))
+      if (items.length < 2) return { items: [items[0].item], between: [], segment: null }
+      const r = relation(items[0].shape, items[1].shape, items[0].solid && items[1].solid)
+      const between = [{ name: "最短距离", value: r.d <= TOUCH ? "0（接触）" : `${fmt(r.d)} mm` }]
+      if (r.overlap > 1e-6) between.push({ name: "重叠体积", value: `${fmt(r.overlap)} mm³（相交）` })
+      return { items: items.map((x) => x.item), between, segment: r.segment }
+    } finally {
+      owned.forEach((x) => x.delete())
+    }
+  }
+
+  /** The shape a measure target stands for; shapes made here go into `owned` to be freed. */
+  private targetShape(step: Step, t: MeasureSpec, owned: AnyShape[]): { shape: AnyShape; solid: boolean; item: MeasureResult["items"][number] } {
+    const body = step.body!
+    if (t.kind === "part") {
+      const part = step.parts?.find((p) => p.name === t.name)
+      if (part) {
+        const st = stats(part.body)
+        return { shape: part.body, solid: true, item: { kind: "part", hash: -1, what: `零件「${t.name}」`, facts: [`体积 ${fmt(st.volume)} mm³`, `外形 ${st.size.map(fmt).join("×")}`] } }
+      }
+      const ref = [...(step.refs ?? []), ...this.context].find((r) => r.name === t.name || r.id === t.name)
+      if (ref) return { shape: ref.shape, solid: true, item: { kind: "part", hash: -1, what: `参考体「${ref.name}」`, facts: [`外形 ${sizeOf(ref.shape).map(fmt).join("×")}`] } }
+      const names = [...(step.parts ?? []).map((p) => p.name), ...(step.refs ?? []).map((r) => r.name), ...this.context.map((r) => r.name)]
+      throw new InputError(`没有叫「${t.name}」的零件或参考体${names.length ? `：现在有 ${names.join("、")}` : "（还没有拆件，整个模型只有一个实体）"}`)
+    }
+    const faces = faceInfos(body, step.origins)
+    const edges = t.kind === "edge" ? edgeInfos(body, faces) : []
+    try {
+      if (t.kind === "feature") {
+        const mine = faces.filter((f) => f.origin === t.id)
+        const f = this.tree.features.find((x) => x.id === t.id)
+        if (!f) throw new InputError(`找不到特征「${t.id}」`)
+        if (!mine.length) throw new InputError(`「${displayName(this.tree, f)}」生成的面现在都不在了（被后面的特征盖掉或切掉了）`)
+        const shape = makeCompound(mine.map((x) => x.face.clone())) as unknown as AnyShape
+        owned.push(shape)
+        return { shape, solid: false, item: { kind: "feature", hash: -1, what: `「${displayName(this.tree, f)}」的面`, facts: [`${mine.length} 个面`] } }
+      }
+      const x = t.kind === "face" ? faces.find((f) => f.face.hashCode === t.hash) : edges.find((e) => e.edge.hashCode === t.hash)
+      if (!x) throw new InputError("要量的面或边找不到了")
+      const shape = ("face" in x ? x.face : x.edge).clone() as AnyShape
+      owned.push(shape)
+      const res = measure(body, step.origins, [t])
+      return { shape, solid: false, item: res?.items[0] ?? { kind: t.kind, hash: t.hash, what: t.kind === "face" ? "面" : "边", facts: [] } }
+    } finally {
+      disposeInfos(faces, edges)
+    }
   }
 
   /** STEP or STL of the body; after a split, one STEP with a named solid per part, or a zip of one STL per part. */
@@ -731,12 +870,14 @@ export class Kernel {
     this.disposeFrom(0)
     for (const shape of this.parsed.values()) shape.delete()
     this.parsed.clear()
+    this.context.forEach((r) => r.shape.delete())
+    this.context = []
   }
 
   // ---------------------------------------------------------------- internals
 
   /** Last step before `i` that produced a body (ok state). */
-  private lastBuilt(i: number): Step | null {
+  lastBuilt(i: number): Step | null {
     for (let k = Math.min(i, this.steps.length) - 1; k >= 0; k--) if (this.steps[k].result.state === "ok") return this.steps[k]
     return null
   }
@@ -765,6 +906,7 @@ export class Kernel {
       edges: prev?.edges ?? null,
       parts: prev?.parts?.map((p) => ({ ...p, owned: false })),
       partOrigins: prev?.partOrigins,
+      mainName: prev?.mainName,
       refs: prev?.refs?.map((r) => ({ ...r, owned: false })),
     }
   }
@@ -780,12 +922,25 @@ export class Kernel {
     try {
       const dup = tree.features.findIndex((x) => x.id === f.id)
       if (tree.features[dup] !== f) throw new InputError(`特征 id「${f.id}」重复了`)
+      const part = partOf(f, tree)
+      const g = part !== f.part ? ({ ...f, part } as Feature) : f
+      const isNew = startsPart(g, prev)
+      if (!isNew && g.part && BODY_OPS.has(f.op) && prev?.body && !(prev.parts && prev.parts.length > 1) && g.part !== (prev.mainName ?? "主体"))
+        throw new InputError(`没有叫「${g.part}」的零件：现在只有一个实体${prev.mainName ? `「${prev.mainName}」` : ""}。要新建零件，就在加料（拉伸、旋转、扫掠、放样）时写这个名字`)
+      const assembly = tree.features.some((x) => x.op === "component")
+      if (assembly && f.op !== "component") throw new InputError("装配里只能放零件（component）。要改零件的形状，用 open_part 打开它的文件")
       const out =
         f.op === "split"
           ? this.split(f, prev)
-          : prev?.parts && prev.parts.length > 1 && (BODY_OPS.has(f.op) || (f.op === "import" && (f.mode ?? "reference") !== "reference"))
-            ? this.onParts(f, prev, prev.parts, warnings)
-            : this.apply(f, prev, warnings)
+          : f.op === "component"
+            ? this.component(f, prev, warnings)
+            : isNew
+            ? this.newPart(g, prev!, warnings)
+            : prev?.parts && prev.parts.length > 1 && (BODY_OPS.has(f.op) || (f.op === "import" && (f.mode ?? "reference") !== "reference"))
+              ? this.onParts(g, prev, prev.parts, warnings)
+              : this.apply(f, prev, warnings)
+      // The first addition may name the body: it is that part until a second one comes.
+      if (!prev?.body && g.part && addsMaterial(g)) step.mainName = g.part
       if (out.parts) step.parts = out.parts
       if (out.ref) step.refs = [...(step.refs ?? []), { id: f.id, name: displayName(tree, f), shape: out.ref, mesh: meshShape(out.ref as Shape3D), edges: meshEdges(out.ref as Shape3D), owned: true }]
       Object.assign(step.result, { summary: out.summary, selected: out.selected })
@@ -793,7 +948,12 @@ export class Kernel {
       if (out.tools) step.tools = out.tools
       if (out.threads) step.threads = out.threads
       if (out.geom) step.geom = out.geom
-      if (out.body) this.commitBody(step, prev, out.body, f.id)
+      if (out.body) {
+        this.commitBody(step, prev, out.body, f.id)
+        // A component's faces are its part file's: its slivers are reported there, not in the assembly.
+        const sliver = f.op === "sketch" || f.op === "import" || f.op === "component" ? null : this.slivers(step)
+        if (sliver) warnings.push(sliver)
+      }
       // Each part's faces are a run of the compound's, in part order.
       if (out.body && step.parts) {
         let at = 0
@@ -832,6 +992,21 @@ export class Kernel {
     step.result.faces = {
       new: step.status.filter((s) => s === "new").length,
       modified: step.status.filter((s) => s === "modified").length,
+    }
+  }
+
+  /** New faces too small to be meant: two faces nearly coinciding, or a cut grazing a face. */
+  private slivers(step: Step): string | null {
+    if (!step.body || !step.status.some((s) => s === "new")) return null
+    const faces = facesOf(step.body)
+    try {
+      const areas = faces.map((f) => measureArea(f))
+      const total = areas.reduce((a, b) => a + b, 0)
+      const tiny = areas.filter((a, i) => step.status[i] === "new" && a < SLIVER_AREA && a < 1e-5 * total)
+      if (!tiny.length) return null
+      return `生成了 ${tiny.length} 个极小的面（最小 ${Math.min(...tiny).toPrecision(2)} mm²）：多半是两个面几乎重合，或者切除擦着面切过去`
+    } finally {
+      faces.forEach((f) => f.delete())
     }
   }
 
@@ -969,6 +1144,7 @@ export class Kernel {
           tool = mergeOverlaps(sketchOn(profile.clone(), plane, origin).extrude(d, { extrusionDirection: dir }) as Shape3D)
           how = "贯穿"
         } else if (f.until) {
+          if (mode === "intersect") throw new InputError("求交不能和成形到（until）一起用")
           if (f.direction === "both") throw new InputError("两侧对称（both）不能和成形到（until）一起用")
           if (f.draft) throw new InputError("成形到不能带拔模角：先成形到，再用拔模特征")
           if (!body || !prev) throw new InputError("还没有实体，没有可以成形到的面")
@@ -1028,13 +1204,40 @@ export class Kernel {
           } else tool = mergeOverlaps(sketchOn(profile.clone(), plane, origin).extrude(d, { extrusionDirection: dir }) as Shape3D)
           how = `${f.direction === "both" ? "两侧对称 " : f.direction === "reverse" ? "反向 " : ""}${fmt(d)} mm${f.draft ? ` · 拔模 ${fmt(n(f.draft))}°` : ""}`
         }
+        if (f.onto) {
+          if (f.through || f.until || f.draft) throw new InputError("onto（沿面等深）只和 distance 一起用，不能带 through、until、draft")
+          if (mode === "intersect") throw new InputError("onto 用于切除或加料")
+          if (!body || !prev) throw new InputError("还没有实体，没有面可以贴")
+          tool.delete()
+          const long = mergeOverlaps(sketchOn(profile.clone(), plane, add(plane.origin, mul(plane.normal, -this.bigLength(body)))).extrude(2 * this.bigLength(body), { extrusionDirection: plane.normal }) as Shape3D)
+          const band = this.band(body, prev.origins, f.onto, n(f.distance!), mode)
+          tool = long.intersect(band.shape)
+          long.delete()
+          band.shape.delete()
+          // Projected straight through, the sketch also lands on the far side of a cylinder: keep the side it faces.
+          if (band.axis) {
+            const side = dot(sub(plane.origin, band.axis.p), plane.normal)
+            if (Math.abs(side) > 1e-6) {
+              const near = solidsOf(tool).filter((x) => {
+                const [a, b] = x.boundingBox.bounds as [V3, V3]
+                return dot(sub(mul(add(a, b), 0.5), band.axis!.p), plane.normal) * side > 0
+              })
+              if (!near.length) throw new InputError("草图投影不到这个圆柱面上：把草图挪到面的正前方")
+              const kept = compoundOf(near)
+              tool.delete()
+              tool = kept
+            }
+          }
+          if (measureShapeVolumeProperties(tool).volume < 1e-9) throw new InputError("草图投影不到选中的面上：把草图挪到面的正前方")
+          how = `沿${band.what}等深 ${fmt(n(f.distance!))} mm`
+        }
         const next = applyTool(body, tool, mode, warnings)
         const box = profile.boundingBox.bounds as [[number, number], [number, number]]
         return {
           body: next,
           tools: [{ tool, mode }],
           geom: f.through ? undefined : { op: "extrude", plane: frameOf(plane), start: origin, dir, box: [box[0], box[1]] },
-          summary: `${f.thin ? `薄壁 ${fmt(n(f.thin.t))} · ` : ""}${mode === "cut" ? "切除" : "加料"} ${how}`,
+          summary: `${f.thin ? `薄壁 ${fmt(n(f.thin.t))} · ` : ""}${mode === "cut" ? "切除" : mode === "intersect" ? "求交" : "加料"} ${how}`,
         }
       }
       case "revolve": {
@@ -1053,9 +1256,18 @@ export class Kernel {
             throw new InputError("轮廓跨过了旋转轴：旋转体只画轴一侧的半截面")
         }
         const mode = f.mode ?? "add"
-        const tool = mergeOverlaps(sketchOn(drawing.clone(), plane).revolve(axis, { origin: [0, 0, 0], angle }) as Shape3D)
+        if (f.symmetric && f.start !== undefined) throw new InputError("start 和 symmetric 只写一个")
+        const start = f.symmetric ? -angle / 2 : f.start !== undefined ? n(f.start) : 0
+        let tool = mergeOverlaps(sketchOn(drawing.clone(), plane).revolve(axis, { origin: [0, 0, 0], angle }) as Shape3D)
+        if (start) tool = tool.rotate(start, [0, 0, 0], axis)
         const next = applyTool(body, tool, mode, warnings)
-        return { body: next, tools: [{ tool, mode }], geom: { op: "revolve", plane: frameOf(plane) }, summary: `${mode === "cut" ? "旋转切除" : "旋转"} ${fmt(angle)}° · 绕 ${f.axis} 轴` }
+        const from = f.symmetric ? " · 两侧对称" : start ? ` · 从 ${fmt(start)}° 起` : ""
+        return {
+          body: next,
+          tools: [{ tool, mode }],
+          geom: { op: "revolve", plane: frameOf(plane) },
+          summary: `${mode === "cut" ? "旋转切除" : mode === "intersect" ? "旋转求交" : "旋转"} ${fmt(angle)}°${from} · 绕 ${f.axis} 轴`,
+        }
       }
       case "fillet":
       case "chamfer": {
@@ -1152,7 +1364,7 @@ export class Kernel {
       }
       case "sweep": {
         const plane = this.plane(f.path.on, prev)
-        const pts = f.path.points.map((p) => (Array.isArray(p) ? { to: [n(p[0]), n(p[1])] as [number, number] } : { to: [n(p.to[0]), n(p.to[1])] as [number, number], via: [n(p.via[0]), n(p.via[1])] as [number, number] }))
+        const pts = evalPoints(f.path.points, n)
         const corner = f.path.corner !== undefined ? n(f.path.corner) : 0
         let pen = draw(pts[0].to)
         pts.slice(1).forEach((p, i) => {
@@ -1237,6 +1449,9 @@ export class Kernel {
         const sources = f.features.flatMap((id) => this.toolsOf(id))
         return this.copyTools(body, sources, [(s) => s.mirror(f.plane, origin)], `镜像 ${f.features.length} 个特征 · ${label}`, warnings)
       }
+      case "component":
+        // Routed by `run` (it changes the parts, not one body).
+        throw new InputError("装配里的零件不在这里处理")
     }
   }
 
@@ -1284,6 +1499,115 @@ export class Kernel {
     ]
     const body = compoundOf(next.map((p) => p.body))
     return { body, parts: next, geom: { op: "sketch", plane: frameOf(plane) }, summary: `拆成 ${back}（V=${fmt(vl)}）、${front}（V=${fmt(vu)}）` }
+  }
+
+  /** An assembly's component: the part file's final shape (built in a kernel of its own, cached), placed. */
+  private component(f: Extract<Feature, { op: "component" }>, prev: Step | null, warnings: string[]): ApplyOut {
+    const n = (v: number | string) => num(v, this.scope)
+    const got = this.components.get(f.file)
+    if (!got) throw new InputError(this.componentsGiven ? `没有读到「${f.file}」` : "装配只能在桌面版 Arbor 里用：网页读不到你电脑上的文件")
+    const built = buildComponent(got.source)
+    const base = f.name ?? f.file.split(/[\\/]/).pop()!.replace(/\.(arbor-asm\.json|arbor\.json|json|step|stp)$/i, "")
+    if (built.failed) warnings.push(`零件「${base}」有 ${built.failed} 个特征失败，用的是失败前的形状`)
+    const placement: Placement = { rotate: (f.rotate ?? []).map((r) => ({ axis: r.axis, angle: n(r.angle) })), at: (f.at ?? [0, 0, 0]).map(n) as V3 }
+    const added: Part[] = built.parts.map((p) => ({
+      name: p.name && built.parts.length > 1 ? `${base}/${p.name}` : base,
+      body: place(p.shape.clone(), placement),
+      explode: [0, 0, 0],
+      owned: true,
+      auto: true,
+      hidden: f.hidden,
+    }))
+    const before: Part[] = !prev?.body ? [] : prev.parts?.length ? prev.parts.map((p) => ({ ...p, owned: false })) : [{ name: prev.mainName ?? "主体", body: prev.body, explode: [0, 0, 0], owned: false, auto: true }]
+    for (const a of added) {
+      if (before.some((p) => p.name === a.name)) {
+        added.forEach((x) => x.body.delete())
+        throw new InputError(`零件名「${a.name}」重复了：给 component 写不同的 name`)
+      }
+      for (const p of before) {
+        const r = relation(a.body, p.body, true)
+        if (r.overlap > 1e-6) warnings.push(`「${a.name}」和「${p.name}」重叠 ${fmt(r.overlap)} mm³`)
+      }
+    }
+    const parts = [...before, ...added]
+    const all = added.length === 1 ? null : compoundOf(added.map((a) => a.body))
+    const size = sizeOf(all ?? added[0].body)
+    all?.delete()
+    // Even a single component stays a named part (measure, checks and hiding go by its name).
+    return { body: compoundOf(parts.map((p) => p.body)), parts, summary: `零件「${base}」← ${f.file} · ${size.map(fmt).join(" × ")}` }
+  }
+
+  /**
+   * The layer `depth` thick under (cut) or over (add) one planar or cylindrical face: cutting a projected
+   * sketch with it gives the same depth everywhere on the face (text on a cap, a groove round a shaft).
+   */
+  private band(body: Shape3D, origins: string[], sel: FaceSelector, depth: number, mode: "add" | "cut"): { shape: Shape3D; what: string; axis?: { p: V3; d: V3 } } {
+    if (!(depth > 0)) throw new InputError("深度（distance）必须大于 0")
+    const faces = faceInfos(body, origins)
+    try {
+      const got = selectFaces(sel, faces, this.scope)
+      if (got.length !== 1) throw new InputError(`onto 要正好选中一个面，现在选中了 ${got.length} 个`)
+      const f = got[0]
+      const big = 2 * this.bigLength(body)
+      if (f.kind === "plane" && f.normal) {
+        // Outward normal: a cut goes in against it, an addition out along it.
+        const dir = mode === "cut" ? mul(f.normal, -1) : f.normal
+        const x: V3 = Math.abs(f.normal[2]) < 0.9 ? [0, 0, 1] : [1, 0, 0]
+        const xd = cross(f.normal, x)
+        const pl = new Plane(f.center, xd, dir)
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          return { shape: (drawRectangle(2 * big, 2 * big).sketchOnPlane(pl) as any).extrude(depth) as Shape3D, what: "平面" }
+        } finally {
+          pl.delete()
+        }
+      }
+      if (f.kind === "cylinder" && f.radius !== undefined) {
+        const ax = cylinderAxis(f)
+        if (!ax) throw new InputError("读不出这个圆柱面的轴线")
+        // Convex (a shaft, a cap) or concave (a bore): which way is into the material.
+        const convex = isConvexCylinder(f, ax)
+        const r = f.radius
+        const [inner, outer] = (mode === "cut") === convex ? [r - depth, r] : [r, r + depth]
+        if (inner <= 1e-6) throw new InputError(`深度 ${fmt(depth)} 超过了圆柱面的半径 R${fmt(r)}`)
+        const base = add(ax.p, mul(ax.d, -big))
+        const cyl = (rad: number) => makeCylinder(rad, 2 * big, base, ax.d) as unknown as Shape3D
+        const o = cyl(outer)
+        const i = cyl(inner)
+        const shape = o.cut(i)
+        o.delete()
+        i.delete()
+        return { shape, what: `圆柱面（R${fmt(r)}）`, axis: { p: ax.p, d: ax.d } }
+      }
+      throw new InputError("onto 只支持平面和圆柱面")
+    } finally {
+      disposeInfos(faces)
+    }
+  }
+
+  /**
+   * Material added under a part name that doesn't exist yet: the tool body alone becomes a new part,
+   * not merged with anything. The body that was there becomes a part too (its first name, or 「主体」).
+   */
+  private newPart(f: Feature, prev: Step, warnings: string[]): ApplyOut {
+    const name = f.part!
+    if ("until" in f && f.until) throw new InputError(`新建零件「${name}」时不能用 until：新零件不和别的料合并，没有「碰到为止」。写 distance`)
+    const alone: Step = { ...prev, body: null, origins: [], parts: undefined, partOrigins: undefined }
+    const w: string[] = []
+    const out = this.apply(f, alone, w)
+    warnings.push(...w.filter((x) => !/不相连的实体/.test(x)))
+    if (!out.body) throw new InputError("这一步没有生成实体")
+    const before: Part[] =
+      prev.parts && prev.parts.length > 1
+        ? prev.parts.map((p) => ({ ...p, owned: false }))
+        : [{ name: prev.mainName ?? "主体", body: prev.body!, explode: [0, 0, 0], owned: false, auto: true }]
+    for (const p of before) {
+      const r = relation(out.body, p.body, true)
+      if (r.overlap > 1e-6) warnings.push(`新零件「${name}」和「${p.name}」重叠 ${fmt(r.overlap)} mm³`)
+    }
+    const parts: Part[] = [...before, { name, body: out.body, explode: [0, 0, 0], owned: true, auto: true }]
+    const named = prev.parts && prev.parts.length > 1 ? "" : prev.mainName ? "" : "；原来的实体叫作「主体」"
+    return { ...out, body: compoundOf(parts.map((p) => p.body)), parts, summary: `${out.summary} · 新零件「${name}」${named}` }
   }
 
   /**
@@ -1339,6 +1663,7 @@ export class Kernel {
     // A pattern of a pattern (or of a many-hole feature) multiplies: count the bodies this step makes.
     const made = sources.reduce((n, s) => n + countOf(s.tool, "solid"), 0) * moves.length
     if (made > MAX_COUNT) throw new InputError(`这一步要复制出 ${made} 个实体，最多 ${MAX_COUNT} 个`)
+    if (sources.some((s) => s.mode === "intersect")) throw new InputError("求交的特征不能阵列或镜像")
     let cur = body
     const tools: Tool[] = []
     for (const { tool, mode } of sources) {
@@ -1351,6 +1676,136 @@ export class Kernel {
     }
     return { body: cur, tools, summary }
   }
+}
+
+/** Does the cylinder face bulge outwards (a shaft) rather than inwards (a bore)? Its outward normal points away from the axis. */
+function isConvexCylinder(f: FaceInfo, ax: { p: V3; d: V3 }): boolean {
+  const pt = f.face.pointOnSurface(0.5, 0.5)
+  const nrm = f.face.normalAt(pt)
+  try {
+    const p: V3 = [pt.x, pt.y, pt.z]
+    const k = dot(sub(p, ax.p), ax.d)
+    const radial = sub(p, add(ax.p, mul(ax.d, k)))
+    return dot([nrm.x, nrm.y, nrm.z], radial) > 0
+  } finally {
+    pt.delete()
+    nrm.delete()
+  }
+}
+
+/** What a component's built shape depends on: its tree, the bytes it reads, its own components. */
+function componentKey(c: ComponentSource): string {
+  if (c.error) return `error:${c.error}`
+  if (c.bytes !== undefined) return `step:${c.bytes ? contentHash(c.bytes) : "missing"}`
+  return JSON.stringify([c.tree, (c.assets ?? []).map((a) => [a.name, a.bytes ? contentHash(a.bytes) : a.error]), (c.components ?? []).map(componentKey)])
+}
+
+/** Build a component (a part file in a kernel of its own, or a STEP file), or take it from the cache. */
+function buildComponent(src: ComponentSource): Built {
+  const key = componentKey(src)
+  const hit = BUILT.get(key)
+  if (hit) {
+    BUILT.delete(key)
+    BUILT.set(key, hit)
+    return hit
+  }
+  if (src.error) throw new InputError(src.error)
+  let built: Built
+  if (src.bytes !== undefined) {
+    if (!src.bytes) throw new InputError(`读不到「${src.file}」`)
+    const shape = readStep(src.bytes) as Shape3D
+    built = { parts: [{ name: null, shape }], failed: 0 }
+  } else {
+    const sub = new Kernel()
+    try {
+      sub.setAssets(src.assets ?? [])
+      sub.setComponents(src.components ?? [])
+      const rep = sub.rebuild(src.tree ?? EMPTY_TREE)
+      const last = sub.lastBuilt(Infinity)
+      if (!last?.body) {
+        const err = rep.paramError ?? rep.features.find((x) => x.state === "error")?.message
+        throw new InputError(`「${src.file}」一步都没有建成${err ? `：${err}` : ""}`)
+      }
+      const failed = rep.features.filter((x) => x.state === "error").length
+      const parts = last.parts && last.parts.length > 1 ? last.parts.map((p) => ({ name: p.name, shape: p.body.clone() })) : [{ name: null, shape: last.body.clone() }]
+      built = { parts, failed }
+    } finally {
+      sub.dispose()
+    }
+  }
+  BUILT.set(key, built)
+  for (const [k, b] of BUILT) {
+    if (BUILT.size <= MAX_BUILT) break
+    b.parts.forEach((p) => p.shape.delete())
+    BUILT.delete(k)
+  }
+  return built
+}
+
+/** Rotate (in order, about the origin) then move: a component's place in its assembly. */
+function place<T extends AnyShape>(shape: T, p: Placement): T {
+  let s = shape as AnyShape
+  for (const r of p.rotate) s = s.rotate(r.angle, [0, 0, 0], AXIS[r.axis])
+  if (p.at.some((x) => x !== 0)) s = s.translate(p.at)
+  return s as T
+}
+
+/** The inverse of `place`: from the assembly back into the part's own frame. */
+function unplace<T extends AnyShape>(shape: T, p: Placement): T {
+  let s = shape as AnyShape
+  if (p.at.some((x) => x !== 0)) s = s.translate(mul(p.at, -1))
+  for (const r of [...p.rotate].reverse()) s = s.rotate(-r.angle, [0, 0, 0], AXIS[r.axis])
+  return s as T
+}
+
+/**
+ * Where parts that weren't cut apart move at full explode: the biggest of them stays, the others move
+ * away from its middle by 0.6 of the whole's size along that direction (at least 15 mm), as the
+ * upper part of a split moves off along the cut while the lower one stays.
+ */
+function autoExplode(parts: Part[]): V3[] {
+  const boxes = parts.map((p) => p.body.boundingBox.bounds as [V3, V3])
+  const lo: V3 = [0, 1, 2].map((a) => Math.min(...boxes.map((b) => b[0][a]))) as V3
+  const hi: V3 = [0, 1, 2].map((a) => Math.max(...boxes.map((b) => b[1][a]))) as V3
+  const size = sub(hi, lo)
+  const autos = parts.flatMap((p, k) => (p.auto ? [k] : []))
+  if (!autos.length) return parts.map(() => [0, 0, 0])
+  const vol = (k: number) => measureShapeVolumeProperties(parts[k].body).volume
+  const anchor = autos.reduce((a, b) => (vol(b) > vol(a) ? b : a))
+  const centre = (k: number) => mul(add(boxes[k][0], boxes[k][1]), 0.5)
+  return parts.map((p, k) => {
+    if (!p.auto || k === anchor) return [0, 0, 0]
+    let d = sub(centre(k), centre(anchor))
+    let l = Math.hypot(...d)
+    if (l < 1e-6) {
+      d = [0, 0, 1]
+      l = 1
+    }
+    const u = mul(d, 1 / l)
+    const across = Math.abs(dot(size, u.map(Math.abs) as V3))
+    return mul(u, Math.max(15, 0.6 * across))
+  })
+}
+
+/** Features that add material through a tool body (so can start a part). */
+function addsMaterial(f: Feature) {
+  if (f.op === "extrude" || f.op === "revolve" || f.op === "sweep" || f.op === "loft") return (f.mode ?? "add") === "add"
+  return f.op === "import" && f.mode === "add"
+}
+
+/** Does `f` add material under a part name the model doesn't have yet (with a body already there)? */
+function startsPart(f: Feature, prev: Step | null) {
+  if (!f.part || !addsMaterial(f) || !prev?.body) return false
+  if (prev.parts && prev.parts.length > 1) return !prev.parts.some((p) => p.name === f.part)
+  return f.part !== (prev.mainName ?? "主体")
+}
+
+/** A pattern or mirror of features that all went to one part goes to that part too. */
+function partOf(f: Feature, tree: Tree): string | undefined {
+  if (f.part || !((f.op === "linear_pattern" || f.op === "circular_pattern" || f.op === "mirror") && f.features?.length)) return f.part
+  const parts = new Set(f.features.map((id) => tree.features.find((x) => x.id === id)?.part))
+  const [only] = parts
+  return parts.size === 1 && only ? only : undefined
 }
 
 /** A sketch's closed regions, for features that need an area. */
@@ -1419,7 +1874,17 @@ function centerOf(tools: Tool[]): V3 | null {
   return [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2, (a[2] + b[2]) / 2]
 }
 
-function applyTool(body: Shape3D | null, tool: Shape3D, mode: "add" | "cut", warnings: string[]): Shape3D {
+function applyTool(body: Shape3D | null, tool: Shape3D, mode: "add" | "cut" | "intersect", warnings: string[]): Shape3D {
+  if (mode === "intersect") {
+    if (!body) throw new InputError("还没有实体，不能求交")
+    const next = body.intersect(tool)
+    const v = measureShapeVolumeProperties(next).volume
+    if (v < 1e-9) {
+      next.delete()
+      throw new InputError("求交后什么都没剩下：工具体和实体不重叠")
+    }
+    return next
+  }
   if (mode === "cut") {
     if (!body) throw new InputError("还没有实体，不能切除")
     const before = measureShapeVolumeProperties(body).volume
@@ -1430,6 +1895,7 @@ function applyTool(body: Shape3D | null, tool: Shape3D, mode: "add" | "cut", war
   }
   // Booleans already unify same-domain faces; the first solid needs it too,
   // or an extruded circle keeps two half-cylinders and two half-arcs per rim.
+  const solidsBefore = body ? countOf(body, "solid") : 0
   const next = body ? body.fuse(tool) : unified(tool)
   if (body) {
     const before = measureShapeVolumeProperties(body).volume
@@ -1437,7 +1903,15 @@ function applyTool(body: Shape3D | null, tool: Shape3D, mode: "add" | "cut", war
     if (Math.abs(after - before) < 1e-6 * Math.max(1, before)) warnings.push("加的料完全在原实体里面，模型没有变化")
   }
   const solids = countOf(next, "solid")
-  if (solids > 1) warnings.push(`现在是 ${solids} 个不相连的实体：新加的料没有和原来的实体接上`)
+  if (body && solids > solidsBefore) {
+    // Apart, or touching only along an edge or at a point (sharing a face would have merged them).
+    const c = closest(tool, body)
+    warnings.push(
+      c && c.d > TOUCH
+        ? `新加的料离已有实体 ${fmt(c.d)} mm，没接上：现在是 ${solids} 个不相连的实体`
+        : `新加的料只碰到已有实体的边或点，没有共用的面：合并后还是 ${solids} 个不相连的实体`,
+    )
+  } else if (solids > 1) warnings.push(`现在是 ${solids} 个不相连的实体`)
   return next
 }
 
@@ -1493,6 +1967,21 @@ function shapeName(s: SketchShape) {
   }
 }
 
+type V2 = [number, number]
+/** Sketch points with numbers worked out: a corner (rounded by r), an arc through `via`, or a spline ending at `to`. */
+function evalPoints(points: Point[], n: (v: number | string) => number): { to: V2; via?: V2; r?: number; spline?: V2[] }[] {
+  const v2 = (p: (number | string)[]): V2 => [n(p[0]), n(p[1])]
+  return points.map((p) => {
+    if (Array.isArray(p)) return { to: v2(p) }
+    if ("spline" in p) {
+      const sp = p.spline.map(v2)
+      return { to: sp[sp.length - 1], spline: sp }
+    }
+    if ("via" in p) return { to: v2(p.to), via: v2(p.via) }
+    return { to: v2(p.to), r: n(p.r) }
+  })
+}
+
 /** `mirrorText`: the sketch is seen from behind its datum plane, so text is mirrored to read right from outside. */
 function sketchDrawing(shapes: SketchShape[], scope: Scope, mirrorText = false): { drawing: Drawing | null; paths: [number, number][][] } {
   const n = (v: number | string) => num(v, scope)
@@ -1500,7 +1989,7 @@ function sketchDrawing(shapes: SketchShape[], scope: Scope, mirrorText = false):
   const paths: [number, number][][] = []
   for (const s of shapes) {
     if (s.type === "path") {
-      paths.push(pathPoints(s.points.map((p) => (Array.isArray(p) ? { to: [n(p[0]), n(p[1])] as [number, number] } : { to: [n(p.to[0]), n(p.to[1])] as [number, number], via: [n(p.via[0]), n(p.via[1])] as [number, number] }))))
+      paths.push(pathPoints(evalPoints(s.points, n)))
       continue
     }
     const c = s.type !== "polyline" && s.center ? [n(s.center[0]), n(s.center[1])] : [0, 0]
@@ -1554,14 +2043,26 @@ function sketchDrawing(shapes: SketchShape[], scope: Scope, mirrorText = false):
         break
       }
       case "polyline": {
-        const pts = s.points.map((p) => (Array.isArray(p) ? { to: [n(p[0]), n(p[1])] as [number, number] } : { to: [n(p.to[0]), n(p.to[1])] as [number, number], via: [n(p.via[0]), n(p.via[1])] as [number, number] }))
+        const pts = evalPoints(s.points, n)
         const first = pts[0].to
         const last = pts[pts.length - 1]
-        if (!last.via && Math.hypot(last.to[0] - first[0], last.to[1] - first[1]) < 1e-9) pts.pop()
-        if (pts.length < 3 && !pts.some((p) => p.via)) throw new InputError("轮廓至少要 3 个点才能围成面")
+        if (!last.via && !last.spline && Math.hypot(last.to[0] - first[0], last.to[1] - first[1]) < 1e-9) pts.pop()
+        if (pts.length < 3 && !pts.some((p) => p.via || p.spline)) throw new InputError("轮廓至少要 3 个点才能围成面")
         let pen = draw(first)
-        for (const p of pts.slice(1)) pen = p.via ? pen.threePointsArcTo(p.to, p.via) : pen.lineTo(p.to)
-        d = pen.close()
+        for (const p of pts.slice(1)) {
+          if (p.via) pen = pen.threePointsArcTo(p.to, p.via)
+          else if (p.spline) for (const q of p.spline) pen = pen.smoothSplineTo(q)
+          else pen = pen.lineTo(p.to)
+          if (p.r !== undefined) {
+            if (!(p.r > 0)) throw new InputError("拐角圆角半径必须大于 0")
+            pen = pen.customCorner(p.r)
+          }
+        }
+        try {
+          d = pen.close()
+        } catch {
+          throw new InputError("轮廓画不出来：拐角圆角太大（大于相邻的边），或者样条自己交叉了")
+        }
         break
       }
     }

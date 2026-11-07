@@ -81,6 +81,17 @@ export const PlaneRef = z
   .describe("草图平面")
 
 const Center = Vec2.optional().describe("中心，草图坐标，缺省 [0, 0]")
+
+/** A point of a polyline or path as the site's assistant writes it: a corner, or a three-point arc. */
+export const WebPoint = z.union([Vec2, z.object({ to: Vec2, via: Vec2.describe("圆弧经过的中间点") })])
+/** Every point form (desktop agents): also a rounded corner and a smooth spline. */
+export const Point = z.union([
+  Vec2,
+  z.object({ to: Vec2, via: Vec2.describe("圆弧经过的中间点") }),
+  z.object({ to: Vec2, r: Num.describe("这个拐角倒的圆角半径") }).describe("走到 to，这个拐角倒 R 圆角"),
+  z.object({ spline: z.array(Vec2).min(1).describe("依次光滑经过这些点，最后一个是终点") }).describe("从上一个点出发的光滑样条"),
+])
+export type Point = z.infer<typeof Point>
 const Cut = z.boolean().optional().describe("从本草图前面的图形里挖掉（做出内孔）")
 
 export const SketchShape = z.discriminatedUnion("type", [
@@ -119,17 +130,11 @@ export const SketchShape = z.discriminatedUnion("type", [
   }),
   z.object({
     type: z.literal("path"),
-    points: z
-      .array(z.union([Vec2, z.object({ to: Vec2, via: Vec2.describe("圆弧经过的中间点") })]))
-      .min(2)
-      .describe("开放的线，依次连接，不自动闭合；只能用于薄壁拉伸（thin）和筋（rib）"),
+    points: z.array(Point).min(2).describe("开放的线，依次连接，不自动闭合；只能用于薄壁拉伸（thin）和筋（rib）"),
   }),
   z.object({
     type: z.literal("polyline"),
-    points: z
-      .array(z.union([Vec2, z.object({ to: Vec2, via: Vec2.describe("圆弧经过的中间点") })]))
-      .min(2)
-      .describe("依次连接并自动闭合；{to, via} 表示三点圆弧"),
+    points: z.array(Point).min(2).describe("依次连接并自动闭合；{to, via} 表示三点圆弧，{to, r} 是倒圆角的拐角，{spline: [...]} 是光滑样条"),
     cut: Cut,
   }),
 ])
@@ -139,9 +144,14 @@ const Base = {
   name: z.string().optional().describe('中文显示名，例如 "底座拉伸"'),
   intent: z.string().optional().describe("一句话设计意图：为什么这样做"),
   suppressed: z.boolean().optional().describe("压缩：暂时不参与重建（学习者在特征树里设置）"),
-  part: z.string().optional().describe("拆件之后：只作用在这个零件上（零件名）。不写时切除和孔作用在碰到的所有零件上，加料要正好接上一个零件"),
+  part: z
+    .string()
+    .optional()
+    .describe("零件名：只作用在这个零件上。加料时写一个还没有的名字，就新建一个零件（不和别的料合并）。有多个零件时不写：切除和孔作用在碰到的所有零件上，加料要正好接上一个零件"),
 }
-const Mode = z.enum(["add", "cut"]).optional().describe("add = 加料（默认），cut = 切除")
+const Mode = z.enum(["add", "cut", "intersect"]).optional().describe("add = 加料（默认），cut = 切除，intersect = 求交（只留下和工具体重叠的部分）")
+/** The site assistant's modes (intersect is desktop-only for now). */
+export const WebMode = z.enum(["add", "cut"]).optional().describe("add = 加料（默认），cut = 切除")
 
 export const Feature = z.discriminatedUnion("op", [
   z.object({ ...Base, op: z.literal("sketch"), on: PlaneRef, shapes: z.array(SketchShape).min(1) }),
@@ -168,6 +178,9 @@ export const Feature = z.discriminatedUnion("op", [
       .optional()
       .describe("薄壁拉伸：只沿着轮廓线长出一圈等厚的壁；草图可以是开放的线（path）。普通的实心拉伸不要写这个字段"),
     draft: Num.optional().describe("拔模角（度）：正值让侧壁沿拉伸方向向内收，一步拉出锥形凸台或带斜度的槽。不需要斜度就不要写"),
+    onto: FaceSelector.optional().describe(
+      "沿这个面（平面或圆柱面，正好选中一个）的法向等深：草图沿草图法向投影到面上，切除时从面往里切 distance 深，加料时从面往外长 distance 高。圆柱面上刻字、凸字用它，各处深度一样。不需要就不要写",
+    ),
   }),
   z.object({
     ...Base,
@@ -175,6 +188,8 @@ export const Feature = z.discriminatedUnion("op", [
     sketch: z.string(),
     axis: Axis.describe("绕过原点的这根坐标轴旋转"),
     angle: Num.optional().describe("角度，缺省 360"),
+    start: Num.optional().describe("起始角（度）：从草图所在的位置，绕轴按右手定则先转这么多再开始旋转"),
+    symmetric: z.boolean().optional().describe("以草图所在的位置为中线，两侧各转 angle/2"),
     mode: Mode,
   }),
   z.object({ ...Base, op: z.literal("fillet"), edges: EdgeSelector, r: Num.describe("圆角半径") }),
@@ -229,7 +244,7 @@ export const Feature = z.discriminatedUnion("op", [
     path: z
       .object({
         on: PlaneRef.describe("路径所在的平面"),
-        points: z.array(z.union([Vec2, z.object({ to: Vec2, via: Vec2 })])).min(2).describe("路径点（不闭合）；{to, via} 是三点圆弧"),
+        points: z.array(Point).min(2).describe("路径点（不闭合）；{to, via} 是三点圆弧，{spline: [...]} 是光滑样条"),
         corner: Num.optional().describe("直线拐角处自动倒的圆角半径（路径不能有尖角，否则截面会自交）"),
       })
       .describe("扫掠路径"),
@@ -279,6 +294,23 @@ export const Feature = z.discriminatedUnion("op", [
       .describe("依次绕过原点的坐标轴旋转，角度用度；先旋转、后平移"),
     at: Vec3.optional().describe("平移 [x, y, z]"),
   }),
+  // Desktop (Arbor) only: an assembly (*.arbor-asm.json) is a tree of these, each a part file placed in it.
+  z.object({
+    ...Base,
+    op: z.literal("component"),
+    file: z
+      .string()
+      .min(1)
+      .max(200)
+      .describe("零件文件（.arbor.json）、子装配（.arbor-asm.json）或外购件（.step），相对装配文件所在的文件夹"),
+    rotate: z
+      .array(z.object({ axis: Axis, angle: Num }))
+      .max(3)
+      .optional()
+      .describe("依次绕过原点的坐标轴旋转，角度用度；先旋转、后平移"),
+    at: Vec3.optional().describe("平移 [x, y, z]，零件自己的原点放到这里"),
+    hidden: z.boolean().optional().describe("先不显示（还在装配里，导出、核对照常）"),
+  }),
   z.object({
     ...Base,
     op: z.literal("rib"),
@@ -304,6 +336,14 @@ export type SketchShape = z.infer<typeof SketchShape>
 
 const Said = z.string().describe("学习者的原话片段，如「壁厚 2」")
 const Pick = z.object({ face: FaceSelector.optional(), edge: EdgeSelector.optional() }).describe("量哪里：一个面（face）或一条边（edge），选择器要正好选中一个")
+const Where = z
+  .object({
+    face: FaceSelector.optional(),
+    edge: EdgeSelector.optional(),
+    feature: z.string().optional().describe("这个特征生成和修改的、现在仍存在的所有面（特征 id）"),
+    part: z.string().optional().describe("零件名，或参考体（import 的 id 或名字）"),
+  })
+  .describe("一处：face 或 edge（选择器正好选中一个）、feature 或 part，写一个")
 const CheckBase = { id: z.string().describe("短英文 id，如 size、wall、holes；同 id 会覆盖原来那一项"), said: Said, tol: z.number().positive().optional().describe("容差，缺省长度 0.01 mm、角度 0.05°") }
 
 /** A requirement the learner stated, measured by the kernel on every rebuild (expected values are plain numbers). */
@@ -323,12 +363,33 @@ export const Check = z.discriminatedUnion("kind", [
   z.object({ ...CheckBase, kind: z.literal("angle"), a: FaceSelector, b: FaceSelector, expect: z.number() }),
   z.object({ ...CheckBase, kind: z.literal("volume"), min: z.number().optional(), max: z.number().optional() }),
   // Against a reference body brought in with `import` (desktop app): fit around a board, a part to mate with.
-  z.object({ ...CheckBase, kind: z.literal("clearance"), ref: z.string().describe("参考体的特征 id（import）"), min: z.number().describe("零件和参考体之间最小的间隙，mm") }),
-  z.object({ ...CheckBase, kind: z.literal("interference"), ref: z.string().describe("参考体的特征 id（import）：零件不能和它相交") }),
+  z.object({ ...CheckBase, kind: z.literal("clearance"), ref: z.string().describe("参考体的特征 id（import），或一个零件的名字"), min: z.number().describe("和它之间最小的间隙，mm") }),
+  z.object({ ...CheckBase, kind: z.literal("interference"), ref: z.string().describe("参考体的特征 id（import），或一个零件的名字：其余部分不能和它相交") }),
+  // Desktop (Arbor) only for now: left out of the site assistant's `check` (tools.ts).
+  z.object({
+    ...CheckBase,
+    kind: z.literal("position"),
+    at: Pick,
+    axis: z.enum(["X", "Y", "Z"]).optional().describe("只核对这一个坐标；不写时核对 [x, y, z]"),
+    expect: z.union([z.number(), z.array(z.number()).length(3)]).describe("写了 axis 时是一个数，没写时是 [x, y, z]"),
+  }),
+  z.object({
+    ...CheckBase,
+    kind: z.literal("gap"),
+    a: Where,
+    b: Where,
+    min: z.number().optional().describe("至少隔这么远（相交就不过）"),
+    max: z.number().optional().describe("最多隔这么远；0 = 必须贴上"),
+  }),
 ])
+
+/** Check kinds only the desktop app's agents get (the site's assistant keeps its tested set). */
+export const DESKTOP_CHECKS = new Set(["position", "gap"])
 export type Check = z.infer<typeof Check>
 
 export const Tree = z.object({
+  /** Desktop (Arbor): a shared parameter file (*.params.json) next to the part; its parameters win over the part's own. */
+  uses: z.string().min(1).max(200).optional(),
   params: z.record(z.string(), Num),
   /** One line per parameter for people (「总长，沿 X」); never used in calculations. */
   paramNotes: z.record(z.string(), z.string()).optional(),
@@ -358,6 +419,7 @@ export const OP_NAMES: Record<FeatureOp, string> = {
   rib: "筋",
   split: "拆件",
   import: "导入",
+  component: "零件",
 }
 
 /** Display name: the model's own name, else 「拉伸2」 style numbering. */

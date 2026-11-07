@@ -38,7 +38,7 @@ export function PartsSidebar({ snapshot }: { snapshot: Snapshot | null }) {
                   <span className="truncate">{p.name}</span>
                 </span>
                 <span className="flex items-center gap-2 text-caption text-faint-foreground">
-                  {p.features} 个特征
+                  {p.features} 个{p.kind === "assembly" ? "零件" : "特征"}
                   {p.openNotes > 0 && <span className="text-warning">{p.openNotes} 条备注</span>}
                 </span>
               </button>

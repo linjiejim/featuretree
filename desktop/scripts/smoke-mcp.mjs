@@ -105,5 +105,34 @@ if (withApp) {
   assert.ok(look.isError, "look needs the window")
 }
 
+// An assembly: two part files sharing a parameter file, placed and checked together.
+assert.ok(!(await call("open_part", { path: "pen/barrel", create: true })).isError)
+assert.ok(!(await call("share_params", { file: "pen.params.json", create: true })).isError)
+assert.ok(!(await call("set_params", { set: { D: 10, L: 60 }, shared: true })).isError)
+await call("sketch", { id: "s", on: { plane: "XY" }, shapes: [{ type: "circle", d: "D" }] })
+assert.ok(!(await call("extrude", { id: "e", sketch: "s", distance: "L" })).isError)
+assert.ok(!(await call("open_part", { path: "pen/cap", create: true })).isError)
+assert.ok(!(await call("share_params", { file: "pen.params.json" })).isError)
+await call("sketch", { id: "s", on: { plane: "XY" }, shapes: [{ type: "circle", d: "D+2" }] })
+await call("extrude", { id: "e", sketch: "s", distance: 20 })
+const asm = await call("open_part", { path: "pen/pen.arbor-asm.json", create: true })
+assert.match(asm.text, /已新建装配/)
+await call("share_params", { file: "pen.params.json" })
+assert.ok(!(await call("component", { id: "barrel", name: "笔杆", file: "barrel.arbor.json" })).isError)
+assert.ok(!(await call("component", { id: "cap", name: "笔帽", file: "cap.arbor.json", at: [0, 0, "L"] })).isError)
+const fit = await call("check", { items: [{ id: "seat", said: "笔帽压在笔杆上", kind: "gap", a: { part: "笔帽" }, b: { part: "笔杆" }, max: 0 }] })
+assert.ok(!fit.text.includes("✗"), fit.text)
+const longer = await call("set_params", { set: { L: 70 } })
+assert.match(longer.text, /共享参数（pen\.params\.json）：L = 70/)
+assert.ok(!(await call("export", { path: "out/pen-bom.md" })).isError)
+assert.match(await readFile(path.join(work, "out/pen-bom.md"), "utf8"), /笔帽/)
+const inCtx = await call("open_part", { path: "pen/barrel", context: "pen/pen.arbor-asm.json" })
+assert.match(inCtx.text, /在装配「pen」里编辑/)
+if (withApp) {
+  const close = await call("look", { focus: { part: "笔帽" }, section: { plane: "XZ", offset: 0 } })
+  assert.ok(close.images.length >= 2, "a section with a close-up")
+  for (const [i, img] of close.images.entries()) await writeFile(path.join(work, `look-asm-${i}.png`), Buffer.from(img.data, "base64"))
+}
+
 await client.close()
 console.log(`\nMCP smoke passed (${withApp ? "with the app" : "headless"}). Part: ${file}`)
